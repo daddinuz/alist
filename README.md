@@ -18,7 +18,7 @@ or cases where insertion order matters.
 
 ## When to Use `alist`
 
-- Small datasets where performance differences between `Vec` and hash-based maps are negligible.
+- Small datasets where insertions and removals are infrequent.
 - Applications that rely on predictable insertion order.
 - When working with keys that are not `Hash` or `Ord`.
 
@@ -72,8 +72,8 @@ assert_eq!(alist.get(&mut bookmark), Some(&42));
 
 ## Safety and Coverage
 
-This crate contains no unsafe code.
-All tests run under [miri](https://github.com/rust-lang/miri) and the tests cover about 50% of the code.
+This crate contains no unsafe code.  
+All tests run under [miri](https://github.com/rust-lang/miri) and the tests cover about 50% of the code.  
 You can generate the coverage report using [tarpaulin](https://github.com/xd009642/tarpaulin).
 
 ## Contributions
