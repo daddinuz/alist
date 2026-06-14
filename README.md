@@ -1,26 +1,39 @@
 # alist
 
-`alist` is a Rust crate that implements association lists, inspired by Lisp, as lightweight alternative to `HashMap` and `BTreeMap`.
-The list is backed by a `Vec` of key-value pairs and preserves the order of insertion.
-It offers unique features like bookmarks for efficient item retrieval and is particularly well-suited for small datasets
-or cases where insertion order matters.
+`alist` is a Rust crate that implements association lists, inspired by Lisp, as a lightweight alternative to `HashMap` and `BTreeMap`.
+The list is backed by a `Vec` of key-value pairs and keeps insertion order across insertions and removals.
+It offers bookmarks for efficient repeated lookup and is particularly well-suited for small datasets.
+Key-based operations scan linearly, so `AList` should be used only for small inputs and only with keys that meet
+`FastEq`'s intended contract: compact key types with cheap equality.
 
 ---
 
 ## Features
 
-- **Order Preservation**: Keys and values are stored in insertion order, making `alist` predictable and easy to iterate over.
-- **Bookmark API**: Efficiently retrieve frequently accessed items with O(1) access when bookmarks are used and items remain unmoved.
-- **Flexible Key Requirements**: Unlike `HashMap` or `BTreeMap`, `alist` requires keys to only implement `Eq`.
+- **Order Preservation**: Keys and values are stored in insertion order across insertions and removals.
+- **Bookmark API**: Reuse a stored position for O(1) lookup when the bookmarked item has not moved; otherwise lookup falls back to a scan and refreshes the bookmark.
+- **FastEq Keys**: Lookup and insertion APIs require `FastEq`, an `Eq` marker trait for types with trivial equality comparisons.
 - **Convenience**: Includes iterators for keys, values, and entries, as well as standard collection utilities like `retain`, `clear`, and `shrink`.
 
 ---
 
 ## When to Use `alist`
 
-- Small datasets where insertions and removals are infrequent.
+- Small datasets only; key-based lookups, replacement insertions, removals, and entry access are `O(n)`.
 - Applications that rely on predictable insertion order.
-- When working with keys that are not `Hash` or `Ord`.
+- Compact keys that implement `FastEq`, have cheap equality, and do not need to implement `Hash` or `Ord`.
+
+---
+
+## Choosing Key and Value Types
+
+`AList` stores `(K, V)` pairs contiguously and performs linear scans for key lookup.
+This makes the choice of `K` and `V` part of the performance model:
+
+- Prefer compact keys and values. Large keys or values increase the stride between entries and can reduce cache-line efficiency during scans.
+- Prefer keys with trivial equality. Lookup compares keys repeatedly, so an expensive `Eq` implementation can dominate runtime.
+- `String` does not implement `FastEq` because string equality is `O(n)` in the string length. Prefer small identifiers, interned symbols, indices, or other compact keys when using `AList`.
+- If values are large, consider storing an indirection such as `Box`, `Rc`, or `Arc` so scans move across compact pairs.
 
 ---
 
@@ -36,7 +49,7 @@ or edit your Cargo.toml manually by adding:
 
 ```toml
 [dependencies]
-alist = "0.1"
+alist = "0.2"
 ```
 
 ## Examples
@@ -47,34 +60,30 @@ alist = "0.1"
 use alist::AList;
 
 let mut alist = AList::new();
-alist.insert("key1", 42);
-alist.insert("key2", 99);
+alist.insert('a', 42);
+alist.insert('b', 99);
 
-assert_eq!(alist.get("key1"), Some(&42));
+assert_eq!(alist.get(&'a'), Some(&42));
 assert_eq!(alist.len(), 2);
 ```
 
-Using the Bookmark API:
+Using the bookmark API:
 
 ```rust
-use alist::{AList, Bookmark};
+use alist::AList;
 
 let mut alist = AList::new();
-alist.insert("key1", 42);
-alist.insert("key2", 99);
+alist.insert('a', 42);
+alist.insert('b', 99);
 
-// Bookmarks' lifetime is independant of that of alists
-let mut bookmark = alist.bookmark("key1").unwrap();
+let mut bookmark = alist.bookmark(&'a').unwrap();
 
-// Fast retrieval using bookmark
 assert_eq!(alist.get(&mut bookmark), Some(&42));
 ```
 
 ## Safety and Coverage
 
 This crate contains no unsafe code.  
-All tests run under [miri](https://github.com/rust-lang/miri) and the tests cover about 50% of the code.  
-You can generate the coverage report using [tarpaulin](https://github.com/xd009642/tarpaulin).
 
 ## Contributions
 

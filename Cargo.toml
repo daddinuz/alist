@@ -1,12 +1,24 @@
 [package]
-authors = ["Davide Di Carlo <daddinuz@gmail.com>"]
-description = "Association list offering fast lookups while preserving insertion order"
 name = "alist"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-keywords = ["collections", "alist", "hash", "association", "map"]
-rust-version = "1.71.1"
+version = "0.2.0"
+authors = ["Davide Di Carlo <daddinuz@gmail.com>"]
+edition = "2024"
+rust-version = "1.86"
+description = "Small insertion-ordered association list for keys with cheap equality"
+documentation = "https://docs.rs/alist"
+readme = "README.md"
 repository = "https://github.com/daddinuz/alist"
+license = "MIT"
+keywords = ["collections", "alist", "association", "map", "no-std"]
+categories = ["data-structures", "no-std"]
 
-[dependencies]
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "benchmark"
+harness = false

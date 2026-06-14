@@ -1,7 +1,12 @@
+//! Shared-reference iterator over keys.
+
 use core::fmt;
 
-type Delegate<'a, K, V> = std::slice::Iter<'a, (K, V)>;
+type Delegate<'a, K, V> = core::slice::Iter<'a, (K, V)>;
 
+/// Iterator over borrowed keys in insertion order.
+///
+/// This type is returned by [`AList::keys`](crate::AList::keys).
 pub struct Keys<'a, K, V> {
     delegate: Delegate<'a, K, V>,
 }
@@ -42,7 +47,7 @@ impl<'a, K, V> Iterator for Keys<'a, K, V> {
     }
 }
 
-impl<'a, K, V> std::iter::FusedIterator for Keys<'a, K, V> {}
+impl<'a, K, V> core::iter::FusedIterator for Keys<'a, K, V> {}
 
 impl<'a, K, V> ExactSizeIterator for Keys<'a, K, V> {
     fn len(&self) -> usize {
@@ -74,5 +79,62 @@ impl<'a, K, V> Clone for Keys<'a, K, V> {
         Self {
             delegate: self.delegate.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{format, vec, vec::Vec};
+
+    use crate::{AList, alist};
+
+    #[test]
+    fn yields_keys_in_insertion_order_after_removal() {
+        let mut sut = alist! { 'a' => 1, 'b' => 2, 'c' => 3 };
+        assert!(sut.remove(&'b').is_some());
+
+        let keys: Vec<_> = sut.keys().collect();
+
+        assert_eq!(keys, vec![&'a', &'c']);
+    }
+
+    #[test]
+    fn supports_exact_size_nth_and_double_ended_iteration() {
+        let sut = alist! { 'a' => 1, 'b' => 2, 'c' => 3, 'd' => 4 };
+        let mut keys = sut.keys();
+
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.nth(1), Some(&'b'));
+        assert_eq!(keys.next_back(), Some(&'d'));
+        assert_eq!(keys.nth_back(0), Some(&'c'));
+        assert_eq!(keys.next(), None);
+    }
+
+    #[test]
+    fn clone_preserves_iterator_position() {
+        let sut = alist! { 'a' => 1, 'b' => 2 };
+        let mut keys = sut.keys();
+
+        assert_eq!(keys.next(), Some(&'a'));
+
+        let mut clone = keys.clone();
+        assert_eq!(keys.next(), Some(&'b'));
+        assert_eq!(clone.next(), Some(&'b'));
+    }
+
+    #[test]
+    fn empty_iterator_is_fused() {
+        let sut: AList<char, i32> = AList::new();
+        let mut keys = sut.keys();
+
+        assert_eq!(keys.next(), None);
+        assert_eq!(keys.next(), None);
+    }
+
+    #[test]
+    fn debug_shows_remaining_pairs() {
+        let sut = alist! { 'a' => 1 };
+
+        assert_eq!(format!("{:?}", sut.keys()), "Keys([('a', 1)])");
     }
 }

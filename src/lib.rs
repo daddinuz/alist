@@ -1,42 +1,66 @@
+#![forbid(unsafe_code)]
+#![no_std]
+
 //! # alist
 //!
-//! `alist` is a Rust crate for working with **association lists**,
-//! a simple data structure inspired by Lisp.
+//! `alist` provides an insertion-ordered association list backed by a `Vec`.
+//!
+//! The crate is `no_std` and uses `alloc` for owned storage.
 //!
 //! This implementation is backed by a `Vec` of key-value pairs,
-//! preserving the order of insertions and enabling optimized
-//! retrieval of items in `O(1)` under certain conditions.
+//! preserving insertion order across insertions and removals and enabling
+//! optimized bookmark lookups in `O(1)` when the bookmarked item has not moved.
 //!
 //! ## What is an Association List?
 //!
 //! An **association list (alist)** is a collection of key-value pairs.
-//! It provides a lightweight alternative to hash-based data structures
-//! for simple mappings or dictionary-like functionality, especially in
-//! contexts where order and immutability are crucial.
+//! It provides a lightweight alternative to hash-based and tree-based maps for
+//! simple mapping or dictionary-like functionality, especially when the dataset
+//! is small and iteration order matters.
 //!
-//! Like `HashMap`, this implementation does not allow multiple values for the same key,
-//! inserting a duplicate key overwrites the existing value.
+//! Like `HashMap`, this implementation does not allow multiple values for the same key:
+//! inserting a duplicate key overwrites the existing value while preserving the key's original insertion position.
 //!
-//! Association lists often outperform hashmaps when working with small datasets, but their performance tends to degrade
-//! as the dataset grows larger.
+//! Association lists can avoid hashing and ordering overhead for small
+//! datasets, but key-based operations scan linearly and degrade as the dataset grows.
+//! Use `AList` only for small inputs and only when keys satisfy [`FastEq`]'s intended contract:
+//! compact key types with cheap equality.
 //!
-//! This crate mitigates the typical performance drawbacks of association lists on larger datasets by leveraging the
-//! stable ordering of items in the list through the Bookmark API.
+//! This crate mitigates repeated lookup costs by leveraging stored positions through the Bookmark API.
 //!
-//! Items in the `alist` are stored in insertion order, which only changes when an element is removed. This property allows
-//! the creation of a "bookmark" for an item, significantly improving retrieval times.
+//! Items in the `alist` are stored in insertion order. Removing an item shifts later items left while preserving their
+//! relative order. Bookmarks account for that by validating and refreshing their stored position.
 //!
-//! A bookmark is essentially a record of the item's position in the internal vector. If the item has not been moved,
-//! access to it is `O(1)`. If the item has been moved, a linear search is performed, with a worst-case complexity of `O(n)`.
+//! A bookmark is a record of the item's position in the internal vector. If the item is still at that position,
+//! access is `O(1)`. If it has moved, a linear search is performed, with a worst-case complexity of `O(n)`, and the
+//! bookmark is refreshed.
+//!
+//! ## Lookup Arguments
+//!
+//! Lookup methods accept borrowed keys for one-off access. Methods such as [`AList::get`],
+//! [`AList::get_mut`], and [`AList::contains_key`] also accept mutable bookmarks so the cached position can be
+//! refreshed when needed. Removal methods accept borrowed keys or owned bookmarks; a bookmark is consumed when used for
+//! removal because removing the entry invalidates the cached position.
 //!
 //! These features make `alist` a viable alternative to `HashMap` or `BTreeMap` in scenarios where:
 //! - Data removal is infrequent.  
 //! - The dataset is small.  
-//! - The data type does not implement `Hash` or `Ord`, as this crate only requires items to implement `Eq`.  
+//! - Keys implement [`FastEq`] but do not need to implement `Hash` or `Ord`.  
+//!
+//! ## Choosing Key and Value Types
+//!
+//! `AList` stores `(K, V)` pairs contiguously and performs linear scans for key lookup.
+//! This makes the size of `K` and `V` important: large keys or values increase the stride between entries and can reduce
+//! cache-line efficiency while scanning. Prefer compact keys and values, or store large values behind an indirection such
+//! as `Box`, `Rc`, or `Arc`.
+//!
+//! Key equality also matters. Lookup compares keys repeatedly, so `AList` requires [`FastEq`] to keep lookup APIs focused
+//! on key types with cheap equality. `String` does not implement [`FastEq`] because its `Eq` implementation is `O(n)` in
+//! the string length. Prefer small identifiers, interned symbols, indices, or other compact keys when possible.
 //!
 //! ### Key Features:
-//! - **Order Preservation**: Items are stored in insertion order, which can be essential for certain applications.
-//! - **Optimized Retrieval**: By leveraging the sequential nature of the underlying `Vec`, the implementation supports an optimization for retrieving items in `O(1)`.
+//! - **Order Preservation**: Items are stored in insertion order across insertions and removals.
+//! - **Optimized Retrieval**: Bookmarks support `O(1)` access while their stored positions remain valid.
 //! - **Simplicity**: A straightforward design that avoids the overhead of hash-based collections while providing robust functionality.
 //!
 //! ### Example in Rust:
@@ -44,25 +68,28 @@
 //! use alist::AList;
 //!
 //! let mut alist = AList::new();
-//! alist.insert("key1", "value1");
-//! alist.insert("key2", "value2");
+//! alist.insert('a', "value1");
+//! alist.insert('b', "value2");
 //!
 //! // Linear lookup
-//! if let Some(value) = alist.get("key1") {
+//! if let Some(value) = alist.get(&'a') {
 //!     println!("Found: {}", value);
 //! }
 //!
 //! // Fast lookup
-//! let mut k2 = alist.bookmark("key2").unwrap();
+//! let mut k2 = alist.bookmark(&'b').unwrap();
 //! assert_eq!(alist.get(&mut k2), Some(&"value2"));
 //!
 //! // Overwriting a value
-//! alist.insert("key1", "new_value");
-//! assert_eq!(alist.get("key1"), Some(&"new_value"));
+//! alist.insert('a', "new_value");
+//! assert_eq!(alist.get(&'a'), Some(&"new_value"));
 //! ```
+
+extern crate alloc;
 
 mod bookmark;
 mod entry;
+mod fast_eq;
 mod into_iter;
 mod into_keys;
 mod into_values;
@@ -78,6 +105,7 @@ mod values_mut;
 
 pub use bookmark::Bookmark;
 pub use entry::Entry;
+pub use fast_eq::FastEq;
 pub use into_iter::IntoIter;
 pub use into_keys::IntoKeys;
 pub use into_values::IntoValues;
@@ -91,21 +119,30 @@ pub use values_mut::ValuesMut;
 
 use sailed::{ContainsKey, Get, GetKeyValue, GetKeyValueMut, GetMut, Remove, RemoveEntry};
 
+use alloc::vec::Vec;
+
 use core::borrow::Borrow;
 use core::fmt;
-use core::hash::{BuildHasher, Hash, Hasher};
+use core::hash::{Hash, Hasher};
 
-use std::collections::hash_map::{DefaultHasher, RandomState};
-use std::sync::OnceLock;
-
-/// A association list (alist) implementation, backed by a `Vec` of key-value pairs.
+/// An association list implementation backed by a `Vec` of key-value pairs.
 ///
-/// `AList` preserves the insertion order of elements, making it suitable for scenarios where order matters.
-/// It requires keys to implement only the `Eq` trait, providing a simple alternative to `HashMap` or `BTreeMap`.
+/// `AList` preserves insertion order across insertions and removals, making it suitable for scenarios where order matters
+/// and removals are infrequent. Lookup and insertion APIs require keys to implement the [`FastEq`] trait.
+/// For best performance, choose compact key and value types and keys with trivial equality.
+///
+/// ## Complexity and Intended Use
+///
+/// `AList` is a linear collection. Key-based lookup, replacement insertion, removal, and entry access scan the stored
+/// pairs and are `O(n)` in the number of entries. Bookmarks can provide `O(1)` access only while their stored position is
+/// still valid; otherwise they fall back to a linear scan.
+///
+/// Use `AList` only for small inputs and only with key types that satisfy [`FastEq`]'s intended contract: compact keys
+/// with cheap equality. For larger collections, or keys with expensive equality, prefer a hash-based or tree-based map.
 ///
 /// ### Features
-/// - **Order Preservation**: Items are stored in insertion order, which can be essential for certain applications.
-/// - **Optimized Retrieval**: By leveraging the sequential nature of the underlying `Vec`, the implementation supports an optimization for retrieving items in `O(1)`.
+/// - **Order Preservation**: Items are stored in insertion order across insertions and removals.
+/// - **Optimized Retrieval**: Bookmarks support `O(1)` access while their stored positions remain valid.
 /// - **Simplicity**: A straightforward design that avoids the overhead of hash-based collections while providing robust functionality.
 ///
 /// ### Example
@@ -113,18 +150,18 @@ use std::sync::OnceLock;
 /// use alist::AList;
 ///
 /// let mut alist = AList::new();
-/// alist.insert("key1", "value1");
-/// alist.insert("key2", "value2");
+/// alist.insert('a', "value1");
+/// alist.insert('b', "value2");
 ///
-/// assert_eq!(alist.get("key1"), Some(&"value1"));
+/// assert_eq!(alist.get(&'a'), Some(&"value1"));
 /// ```
 ///
-/// Use `AList` for small datasets, infrequent removals, or when the data type does not implement `Hash` or `Ord`.
+/// Use `AList` for small datasets, infrequent removals, or keys that implement `FastEq` but do not need `Hash` or `Ord`.
 pub struct AList<K, V> {
     pairs: Vec<(K, V)>,
 }
 
-impl<K: Eq, V> FromIterator<(K, V)> for AList<K, V> {
+impl<K: FastEq, V> FromIterator<(K, V)> for AList<K, V> {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut this = Self::new();
         this.extend(iter);
@@ -147,9 +184,10 @@ impl<K, V> AList<K, V> {
     /// ```rust
     /// use alist::AList;
     ///
-    /// let alist: AList<&str, &str> = AList::new();
+    /// let alist: AList<char, &str> = AList::new();
     /// assert!(alist.is_empty());
     /// ```
+    #[must_use]
     pub const fn new() -> Self {
         Self { pairs: Vec::new() }
     }
@@ -166,10 +204,11 @@ impl<K, V> AList<K, V> {
     /// ```rust
     /// use alist::AList;
     ///
-    /// let alist: AList<&str, &str> = AList::with_capacity(10);
+    /// let alist: AList<char, &str> = AList::with_capacity(10);
     /// assert!(alist.is_empty());
     /// assert!(alist.capacity() >= 10, "Expected the capacity to be at least 10");
     /// ```
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             pairs: Vec::with_capacity(capacity),
@@ -180,11 +219,11 @@ impl<K, V> AList<K, V> {
     ///
     /// This method allows you to "bookmark" a key in the association list, which can be used for more efficient
     /// retrieval of the corresponding value later. The bookmark stores the position of the key in the internal vector,
-    /// and if the item hasn't been moved, retrieving it by this bookmark will be `O(1)`. Otherwise, a linear search is performed.
-    /// If the search is performed the bookmark is updated accordingly.
+    /// and if the key is still at that position, retrieving it by this bookmark will be `O(1)`. Otherwise, a linear
+    /// search is performed and the bookmark is updated.
     ///
     /// ### Parameters
-    /// - `key`: A reference to the key to bookmark. The key must implement `Borrow<Q>`, and `Q` must implement `Eq`.
+    /// - `key`: A reference to the key to bookmark. The key must implement `Borrow<Q>`, and `Q` must implement `FastEq`.
     ///
     /// ### Returns
     /// - `Some(Bookmark)` if the key exists in the list, otherwise `None`.
@@ -194,17 +233,18 @@ impl<K, V> AList<K, V> {
     /// use alist::{AList, Bookmark};
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
-    /// alist.insert("key2", "value2");
+    /// alist.insert('a', "value1");
+    /// alist.insert('b', "value2");
     ///
-    /// if let Some(mut bookmark) = alist.bookmark("key1") {
+    /// if let Some(mut bookmark) = alist.bookmark(&'a') {
     ///     assert_eq!(alist.get(&mut bookmark), Some(&"value1"));
     /// }
     /// ```
+    #[must_use]
     pub fn bookmark<'q, Q>(&self, key: &'q Q) -> Option<Bookmark<'q, Q, K, V>>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: FastEq + ?Sized,
     {
         let position = self.position(key)?;
         Some(Bookmark::new_with_position(key, position))
@@ -217,7 +257,7 @@ impl<K, V> AList<K, V> {
     /// the key is already in the list.
     ///
     /// ### Parameters
-    /// - `key`: The key to look up or insert in the `AList`. The key must implement `Eq`.
+    /// - `key`: The key to look up or insert in the `AList`. The key must implement `FastEq`.
     ///
     /// ### Returns
     /// - An `Entry` object, which can be used to insert or modify a value associated with the key.
@@ -229,16 +269,17 @@ impl<K, V> AList<K, V> {
     /// let mut alist = AList::new();
     ///
     /// // Insert a value if the key doesn't exist
-    /// alist.entry("key1").or_insert("value1");
+    /// alist.entry('a').or_insert("value1");
     ///
     /// // Modify the value if the key exists
-    /// alist.entry("key1").and_modify(|v| *v = "new_value");
+    /// alist.entry('a').and_modify(|v| *v = "new_value");
     ///
-    /// assert_eq!(alist.get("key1"), Some(&"new_value"));
+    /// assert_eq!(alist.get(&'a'), Some(&"new_value"));
     /// ```
-    pub fn entry(&mut self, key: K) -> Entry<K, V>
+    #[must_use]
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V>
     where
-        K: Eq,
+        K: FastEq,
     {
         if let Some(position) = self.position(&key) {
             return Entry::Occupied(OccupiedEntry::new(self, position));
@@ -250,11 +291,11 @@ impl<K, V> AList<K, V> {
     /// Inserts a key-value pair into the `AList`.
     ///
     /// If the key already exists in the `AList`, its value is updated to the provided `value`, and the old value is returned.
-    /// If the key does not exist, the new pair is appended to the list.
+    /// The existing key keeps its insertion position. If the key does not exist, the new pair is appended to the list.
     /// Time complexity is O(n).
     ///
     /// ### Parameters
-    /// - `key`: The key to insert or update. Must implement `Eq`.
+    /// - `key`: The key to insert or update. Must implement `FastEq`.
     /// - `value`: The value to associate with the key.
     ///
     /// ### Returns
@@ -268,34 +309,36 @@ impl<K, V> AList<K, V> {
     /// let mut alist = AList::new();
     ///
     /// // Insert a new key-value pair
-    /// assert!(alist.insert("key1", "value1").is_none());
+    /// assert!(alist.insert('a', "value1").is_none());
     ///
     /// // Update an existing key
-    /// assert_eq!(alist.insert("key1", "new_value"), Some("value1"));
+    /// assert_eq!(alist.insert('a', "new_value"), Some("value1"));
     ///
     /// // Check the updated value
-    /// assert_eq!(alist.get("key1"), Some(&"new_value"));
+    /// assert_eq!(alist.get(&'a'), Some(&"new_value"));
     /// ```
     pub fn insert(&mut self, key: K, value: V) -> Option<V>
     where
-        K: Eq,
+        K: FastEq,
     {
-        match self.find_mut(&key) {
-            Some((_, v)) => Some(std::mem::replace(v, value)),
-            None => {
-                self.pairs.push((key, value));
-                None
-            }
+        if let Some(position) = self.position(&key) {
+            let (_, v) = &mut self.pairs[position];
+            return Some(core::mem::replace(v, value));
         }
+
+        self.pairs.push((key, value));
+        None
     }
 
     /// Retrieves a reference to the value associated with the given key in the `AList`.
     ///
-    /// This method takes any type implementing the `Get<K, V>` trait, enabling flexible key lookups.
-    /// If the key exists in the `AList`, a reference to the associated value is returned. Otherwise, `None` is returned.
+    /// The lookup argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or a mutable [`Bookmark`]. Bookmark lookups refresh the cached position when it is stale.
+    /// If the key exists in the `AList`, a reference to the associated value is returned.
+    /// Otherwise, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `Get<K, V>` trait, used to locate the value.
+    /// - `key`: A borrowed key or mutable bookmark used to locate the value.
     ///
     /// ### Returns
     /// - `Some(&V)` if the key exists in the `AList`.
@@ -306,29 +349,32 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
+    /// alist.insert('a', "value1");
     ///
     /// // Retrieve a value by key
-    /// assert_eq!(alist.get("key1"), Some(&"value1"));
+    /// assert_eq!(alist.get(&'a'), Some(&"value1"));
     ///
     /// // Attempt to retrieve a non-existent key
-    /// assert!(alist.get("key2").is_none());
+    /// assert!(alist.get(&'b').is_none());
     ///
-    /// // Retrive a value by its bookmark
-    /// let mut k1 = alist.bookmark("key1").unwrap();
+    /// // Retrieve a value by its bookmark
+    /// let mut k1 = alist.bookmark(&'a').unwrap();
     /// assert_eq!(alist.get(&mut k1), Some(&"value1"));
     /// ```
+    #[must_use]
     pub fn get(&self, key: impl Get<K, V>) -> Option<&V> {
         key.get(self)
     }
 
     /// Retrieves a mutable reference to the value associated with the given key in the `AList`.
     ///
-    /// This method takes any type implementing the `GetMut<K, V>` trait, enabling flexible key lookups.
-    /// If the key exists in the `AList`, a mutable reference to the associated value is returned. Otherwise, `None` is returned.
+    /// The lookup argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or a mutable [`Bookmark`]. Bookmark lookups refresh the cached position when it is stale.
+    /// If the key exists in the `AList`, a mutable reference to the associated value is returned.
+    /// Otherwise, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `GetMut<K, V>` trait, used to locate the value.
+    /// - `key`: A borrowed key or mutable bookmark used to locate the value.
     ///
     /// ### Returns
     /// - `Some(&mut V)` if the key exists in the `AList`.
@@ -339,30 +385,32 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
+    /// alist.insert('a', "value1");
     ///
     /// // Retrieve a value by key
-    /// assert_eq!(alist.get_mut("key1"), Some(&mut "value1"));
+    /// assert_eq!(alist.get_mut(&'a'), Some(&mut "value1"));
     ///
     /// // Attempt to retrieve a non-existent key
-    /// assert!(alist.get_mut("key2").is_none());
+    /// assert!(alist.get_mut(&'b').is_none());
     ///
-    /// // Retrive a value by its bookmark
-    /// let mut k1 = alist.bookmark("key1").unwrap();
+    /// // Retrieve a value by its bookmark
+    /// let mut k1 = alist.bookmark(&'a').unwrap();
     /// assert_eq!(alist.get_mut(&mut k1), Some(&mut "value1"));
     /// ```
+    #[must_use]
     pub fn get_mut(&mut self, key: impl GetMut<K, V>) -> Option<&mut V> {
         key.get_mut(self)
     }
 
     /// Retrieves a reference to the key and its associated value in the `AList`.
     ///
-    /// This method takes any type implementing the `GetKeyValue<K, V>` trait, enabling flexible key lookups.
-    /// If the key exists in the `AList`, a reference to the key and its associated value is returned as a tuple.
+    /// The lookup argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or a mutable [`Bookmark`]. Bookmark lookups refresh the cached position when it is stale.
+    /// If the key exists in the `AList`, a reference to the stored key and its associated value is returned as a tuple.
     /// Otherwise, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `GetKeyValue<K, V>` trait, used to locate the key-value pair.
+    /// - `key`: A borrowed key or mutable bookmark used to locate the key-value pair.
     ///
     /// ### Returns
     /// - `Some((&K, &V))` if the key exists in the `AList`, containing references to the key and value.
@@ -373,33 +421,35 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
+    /// alist.insert('a', "value1");
     ///
     /// // Retrieve a key-value pair by key
-    /// if let Some((k, v)) = alist.get_key_value("key1") {
-    ///     assert_eq!(k, &"key1");
+    /// if let Some((k, v)) = alist.get_key_value(&'a') {
+    ///     assert_eq!(k, &'a');
     ///     assert_eq!(v, &"value1");
     /// }
     ///
     /// // Attempt to retrieve a non-existent key
-    /// assert!(alist.get_key_value("key2").is_none());
+    /// assert!(alist.get_key_value(&'b').is_none());
     ///
-    /// // Retrive a value by its bookmark
-    /// let mut k1 = alist.bookmark("key1").unwrap();
-    /// assert_eq!(alist.get_key_value(&mut k1), Some((&"key1", &"value1")));
+    /// // Retrieve a value by its bookmark
+    /// let mut k1 = alist.bookmark(&'a').unwrap();
+    /// assert_eq!(alist.get_key_value(&mut k1), Some((&'a', &"value1")));
     /// ```
+    #[must_use]
     pub fn get_key_value(&self, key: impl GetKeyValue<K, V>) -> Option<(&K, &V)> {
         key.get_key_value(self)
     }
 
     /// Retrieves a mutable reference to the key and its associated value in the `AList`.
     ///
-    /// This method takes any type implementing the `GetKeyValueMut<K, V>` trait, enabling flexible key lookups.
-    /// If the key exists in the `AList`, a reference to the key and its associated mutable value is returned as a tuple.
+    /// The lookup argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or a mutable [`Bookmark`]. Bookmark lookups refresh the cached position when it is stale.
+    /// If the key exists in the `AList`, a reference to the stored key and its associated mutable value is returned as a tuple.
     /// Otherwise, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `GetKeyValueMut<K, V>` trait, used to locate the key-value pair.
+    /// - `key`: A borrowed key or mutable bookmark used to locate the key-value pair.
     ///
     /// ### Returns
     /// - `Some((&K, &mut V))` if the key exists in the `AList`, containing references to the key and value.
@@ -410,32 +460,34 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
+    /// alist.insert('a', "value1");
     ///
     /// // Retrieve a key-value pair by key
-    /// if let Some((k, v)) = alist.get_key_value_mut("key1") {
-    ///     assert_eq!(k, &"key1");
+    /// if let Some((k, v)) = alist.get_key_value_mut(&'a') {
+    ///     assert_eq!(k, &'a');
     ///     assert_eq!(v, &mut "value1");
     /// }
     ///
     /// // Attempt to retrieve a non-existent key
-    /// assert!(alist.get_key_value_mut("key2").is_none());
+    /// assert!(alist.get_key_value_mut(&'b').is_none());
     ///
-    /// // Retrive a value by its bookmark
-    /// let mut k1 = alist.bookmark("key1").unwrap();
-    /// assert_eq!(alist.get_key_value_mut(&mut k1), Some((&"key1", &mut "value1")));
+    /// // Retrieve a value by its bookmark
+    /// let mut k1 = alist.bookmark(&'a').unwrap();
+    /// assert_eq!(alist.get_key_value_mut(&mut k1), Some((&'a', &mut "value1")));
     /// ```
+    #[must_use]
     pub fn get_key_value_mut(&mut self, key: impl GetKeyValueMut<K, V>) -> Option<(&K, &mut V)> {
         key.get_key_value_mut(self)
     }
 
     /// Checks if the given key exists in the `AList`.
     ///
-    /// This method takes any type implementing the `ContainsKey<K, V>` trait, allowing flexible key checks.
+    /// The lookup argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or a mutable [`Bookmark`]. Bookmark checks refresh the cached position when it is stale.
     /// It returns `true` if the key is present in the `AList`, and `false` otherwise.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `ContainsKey<K, V>` trait, used to determine if the key exists.
+    /// - `key`: A borrowed key or mutable bookmark used to determine if the key exists.
     ///
     /// ### Returns
     /// - `true` if the key exists in the `AList`.
@@ -446,30 +498,33 @@ impl<K, V> AList<K, V> {
     /// use alist::{AList, Bookmark};
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
+    /// alist.insert('a', "value1");
     ///
     /// // Check for the existence of a key
-    /// assert!(alist.contains_key("key1"));
-    /// assert!(!alist.contains_key("key2"));
+    /// assert!(alist.contains_key(&'a'));
+    /// assert!(!alist.contains_key(&'b'));
     ///
     /// // Check for the existence of a key by its bookmark
-    /// let mut k1 = alist.bookmark("key1").unwrap();
+    /// let mut k1 = alist.bookmark(&'a').unwrap();
     /// assert!(alist.contains_key(&mut k1));
-    /// let mut k2 = Bookmark::new("key2");
+    /// let mut k2 = Bookmark::new(&'b');
     /// assert!(!alist.contains_key(&mut k2));
     /// ```
+    #[must_use]
     pub fn contains_key(&self, key: impl ContainsKey<K, V>) -> bool {
         key.contains_key(self)
     }
 
     /// Removes a key-value pair from the `AList`.
     ///
-    /// This method takes any type implementing the `Remove<K, V>` trait to identify the key to be removed.
+    /// The removal argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or an owned [`Bookmark`]. Removing by bookmark consumes it because removal invalidates the cached position.
     /// If the key exists in the `AList`, the pair is removed, and the associated value is returned.
+    /// Remaining pairs keep their insertion order.
     /// If the key does not exist, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `Remove<K, V>` trait, used to locate the key-value pair to remove.
+    /// - `key`: A borrowed key or owned bookmark used to locate the key-value pair to remove.
     ///
     /// ### Returns
     /// - `Some(V)` containing the value associated with the removed key if it existed.
@@ -480,33 +535,36 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
-    /// alist.insert("key2", "value2");
+    /// alist.insert('a', "value1");
+    /// alist.insert('b', "value2");
     ///
     /// // Remove an existing key
-    /// assert_eq!(alist.remove("key1"), Some("value1"));
-    /// assert!(!alist.contains_key("key1"));
+    /// assert_eq!(alist.remove(&'a'), Some("value1"));
+    /// assert!(!alist.contains_key(&'a'));
     ///
     /// // Remove an existing key by its bookmark
-    /// let k2 = alist.bookmark("key2").unwrap();
+    /// let k2 = alist.bookmark(&'b').unwrap();
     /// assert_eq!(alist.remove(k2), Some("value2"));
-    /// assert!(!alist.contains_key("key2"));
+    /// assert!(!alist.contains_key(&'b'));
     ///
     /// // Attempt to remove a non-existent key
-    /// assert!(alist.remove("key2").is_none());
+    /// assert!(alist.remove(&'b').is_none());
     /// ```
+    #[must_use]
     pub fn remove(&mut self, key: impl Remove<K, V>) -> Option<V> {
         key.remove(self)
     }
 
     /// Removes a key-value pair from the `AList` and returns it as a tuple.
     ///
-    /// This method takes any type implementing the `RemoveEntry<K, V>` trait to locate the key-value pair to remove.
+    /// The removal argument can be a borrowed key, such as `&K` or `&Q` where `K: Borrow<Q>`,
+    /// or an owned [`Bookmark`]. Removing by bookmark consumes it because removal invalidates the cached position.
     /// If the key exists in the `AList`, the pair is removed, and the key and value are returned as a tuple.
+    /// Remaining pairs keep their insertion order.
     /// If the key does not exist, `None` is returned.
     ///
     /// ### Parameters
-    /// - `key`: An input implementing the `RemoveEntry<K, V>` trait, used to locate the key-value pair to remove.
+    /// - `key`: A borrowed key or owned bookmark used to locate the key-value pair to remove.
     ///
     /// ### Returns
     /// - `Some((K, V))` containing the removed key and its associated value if the key existed.
@@ -517,21 +575,22 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", "value1");
-    /// alist.insert("key2", "value2");
+    /// alist.insert('a', "value1");
+    /// alist.insert('b', "value2");
     ///
     /// // Remove an existing key-value pair
-    /// assert_eq!(alist.remove_entry("key1"), Some(("key1", "value1")));
-    /// assert!(!alist.contains_key("key1"));
+    /// assert_eq!(alist.remove_entry(&'a'), Some(('a', "value1")));
+    /// assert!(!alist.contains_key(&'a'));
     ///
     /// // Remove an existing key-value pair by its bookmark
-    /// let k2 = alist.bookmark("key2").unwrap();
-    /// assert_eq!(alist.remove_entry(k2), Some(("key2", "value2")));
-    /// assert!(!alist.contains_key("key2"));
+    /// let k2 = alist.bookmark(&'b').unwrap();
+    /// assert_eq!(alist.remove_entry(k2), Some(('b', "value2")));
+    /// assert!(!alist.contains_key(&'b'));
     ///
     /// // Attempt to remove a non-existent key
-    /// assert!(alist.remove_entry("nonexistent").is_none());
+    /// assert!(alist.remove_entry(&'z').is_none());
     /// ```
+    #[must_use]
     pub fn remove_entry(&mut self, key: impl RemoveEntry<K, V>) -> Option<(K, V)> {
         key.remove_entry(self)
     }
@@ -542,24 +601,24 @@ impl<K, V> AList<K, V> {
     /// Only pairs for which the closure returns `true` are kept in the list; others are removed.
     ///
     /// ### Parameters
-    /// - `f`: A closure of the form `FnMut(&K, &mut V) -> bool`, applied to each key-value pair.
-    ///        If the closure returns `true`, the pair is retained; otherwise, it is removed.
+    /// - `f`: A closure of the form `FnMut(&K, &V) -> bool`, applied to each key-value pair.
+    ///   If the closure returns `true`, the pair is retained; otherwise, it is removed.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
-    /// alist.insert("key3", 3);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
+    /// alist.insert('c', 3);
     ///
     /// // Retain only pairs where the value is greater than 1
     /// alist.retain(|_, v| *v > 1);
     ///
-    /// assert!(!alist.contains_key("key1"));
-    /// assert!(alist.contains_key("key2"));
-    /// assert!(alist.contains_key("key3"));
+    /// assert!(!alist.contains_key(&'a'));
+    /// assert!(alist.contains_key(&'b'));
+    /// assert!(alist.contains_key(&'c'));
     /// ```
     pub fn retain<F>(&mut self, mut f: F)
     where
@@ -575,16 +634,16 @@ impl<K, V> AList<K, V> {
     ///
     /// ### Parameters
     /// - `f`: A closure of the form `FnMut(&K, &mut V) -> bool`, applied to each key-value pair.
-    ///        If the closure returns `true`, the pair is retained; otherwise, it is removed.
+    ///   If the closure returns `true`, the pair is retained; otherwise, it is removed.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
-    /// alist.insert("key3", 3);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
+    /// alist.insert('c', 3);
     ///
     /// // Retain pairs where the value is odd, and double the values
     /// alist.retain_mut(|_, v| {
@@ -596,9 +655,9 @@ impl<K, V> AList<K, V> {
     ///     }
     /// });
     ///
-    /// assert_eq!(alist.get("key1"), Some(&2));
-    /// assert!(!alist.contains_key("key2"));
-    /// assert_eq!(alist.get("key3"), Some(&6));
+    /// assert_eq!(alist.get(&'a'), Some(&2));
+    /// assert!(!alist.contains_key(&'b'));
+    /// assert_eq!(alist.get(&'c'), Some(&6));
     /// ```
     pub fn retain_mut<F>(&mut self, mut f: F)
     where
@@ -607,40 +666,52 @@ impl<K, V> AList<K, V> {
         self.pairs.retain_mut(|(k, v)| f(k, v));
     }
 
+    #[inline]
+    #[must_use]
     fn position<Q>(&self, key: &Q) -> Option<usize>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: FastEq + ?Sized,
     {
-        self.pairs.iter().position(|(k, _)| k.borrow() == key)
+        // Centralized key lookup strategy: if duplicate pairs ever exist
+        // internally, key-based operations target the last matching pair.
+        self.pairs.iter().rposition(|(k, _)| k.borrow() == key)
     }
 
-    fn find<Q>(&self, key: &Q) -> Option<(&K, &V)>
+    #[must_use]
+    fn refresh_position<Q>(&self, key: &Q, previous_position: usize) -> Option<usize>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: FastEq + ?Sized,
     {
-        self.pairs
+        let len = self.pairs.len();
+        if len == 0 {
+            return None;
+        }
+
+        let start = previous_position.min(len - 1);
+
+        // Public APIs keep keys unique, so search order does not change the
+        // result. Prefer the area at or before the previous position because
+        // order-preserving removals shift stale bookmarks left.
+        if let Some(position) = self.pairs[..=start]
             .iter()
-            .find(|(k, _)| k.borrow() == key)
-            .map(|(k, v)| (k, v))
+            .rposition(|(k, _)| k.borrow() == key)
+        {
+            return Some(position);
+        }
+
+        self.pairs[start + 1..]
+            .iter()
+            .rposition(|(k, _)| k.borrow() == key)
+            .map(|position| start + 1 + position)
     }
 
-    fn find_mut<Q>(&mut self, key: &Q) -> Option<(&K, &mut V)>
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        self.pairs
-            .iter_mut()
-            .find(|(k, _)| k.borrow() == key)
-            .map(|(k, v)| (&*k, v))
-    }
-
+    #[must_use]
     fn is_valid<Q>(&self, bookmark: &Bookmark<Q, K, V>) -> bool
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: FastEq + ?Sized,
     {
         self.pairs
             .get(bookmark.position)
@@ -649,23 +720,25 @@ impl<K, V> AList<K, V> {
     }
 }
 
-impl<K: Eq, V> Extend<(K, V)> for AList<K, V> {
+impl<K: FastEq, V> Extend<(K, V)> for AList<K, V> {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         let pairs = iter.into_iter();
 
-        let (lower, upper) = pairs.size_hint();
-        self.reserve(usize::min(upper.unwrap_or(lower), 8));
+        let (lower, _) = pairs.size_hint();
+        self.reserve(lower);
 
         for (key, value) in pairs {
-            match self.find_mut(&key) {
-                None => self.pairs.push((key, value)),
-                Some((_, v)) => *v = value,
+            if let Some(position) = self.position(&key) {
+                let (_, v) = &mut self.pairs[position];
+                *v = value;
+            } else {
+                self.pairs.push((key, value));
             }
         }
     }
 }
 
-impl<'a, K: Eq + Clone, V: Clone> Extend<(&'a K, &'a V)> for AList<K, V> {
+impl<'a, K: FastEq + Clone, V: Clone> Extend<(&'a K, &'a V)> for AList<K, V> {
     fn extend<T: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, values: T) {
         self.extend(values.into_iter().map(|(k, v)| (k.clone(), v.clone())))
     }
@@ -682,8 +755,8 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::with_capacity(100);
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// assert!(alist.capacity() >= 100);
     /// alist.shrink_to_fit();
@@ -706,8 +779,8 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::with_capacity(100);
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// assert!(alist.capacity() >= 100);
     /// alist.shrink_to(10);
@@ -730,7 +803,7 @@ impl<K, V> AList<K, V> {
     /// ```rust
     /// use alist::AList;
     ///
-    /// let mut alist: AList<&str, i32> = AList::new();
+    /// let mut alist: AList<char, i32> = AList::new();
     /// alist.reserve(100);
     /// assert!(alist.capacity() >= 100);
     /// ```
@@ -752,7 +825,7 @@ impl<K, V> AList<K, V> {
     /// ```rust
     /// use alist::AList;
     ///
-    /// let mut alist: AList<&str, i32> = AList::new();
+    /// let mut alist: AList<char, i32> = AList::new();
     /// alist.reserve_exact(100);
     /// assert!(alist.capacity() >= 100);
     /// ```
@@ -772,10 +845,11 @@ impl<K, V> AList<K, V> {
     ///
     /// let mut alist = AList::new();
     /// assert!(alist.capacity() >= 0); // The initial capacity might not be zero.
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     /// assert!(alist.capacity() >= 2); // Capacity is greater than or equal to the number of inserted elements.
     /// ```
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.pairs.capacity()
     }
@@ -790,10 +864,11 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     /// assert_eq!(alist.len(), 2);
     /// ```
+    #[must_use]
     pub fn len(&self) -> usize {
         self.pairs.len()
     }
@@ -809,13 +884,12 @@ impl<K, V> AList<K, V> {
     ///
     /// let mut alist = AList::new();
     /// assert!(alist.is_empty());
-
-    /// alist.insert("key1", 1);
+    /// alist.insert('a', 1);
     /// assert!(!alist.is_empty());
-
     /// alist.clear();
     /// assert!(alist.is_empty());
     /// ```
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
@@ -830,8 +904,8 @@ impl<K, V> AList<K, V> {
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     /// assert_eq!(alist.len(), 2);
     ///
     /// alist.clear();
@@ -845,39 +919,41 @@ impl<K, V> AList<K, V> {
     /// Returns an iterator over the keys of the `AList`.
     ///
     /// This method returns an iterator that yields references to the keys of the key-value pairs stored in the `AList`.
-    /// The keys are yielded in the order they were inserted, and the iterator will not modify the list.
+    /// The keys are yielded in insertion order.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// let keys: Vec<_> = alist.keys().collect();
-    /// assert_eq!(&keys[..], &[&"key1", &"key2"]);
+    /// assert_eq!(&keys[..], &[&'a', &'b']);
     /// ```
-    pub fn keys(&self) -> Keys<K, V> {
+    #[must_use]
+    pub fn keys(&self) -> Keys<'_, K, V> {
         Keys::from_delegate(self.pairs.iter())
     }
 
     /// Consumes the `AList` and returns an iterator over the keys.
     ///
-    /// This method consumes the `AList` and returns an iterator that yields the keys of the key-value pairs in the order
-    /// they were inserted. After calling `into_keys`, the `AList` is no longer accessible as it has been consumed.
+    /// This method consumes the `AList` and returns an iterator that yields keys in insertion order.
+    /// After calling `into_keys`, the `AList` is no longer accessible as it has been consumed.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// let keys: Vec<_> = alist.into_keys().collect();
-    /// assert_eq!(keys, vec!["key1", "key2"]);
+    /// assert_eq!(keys, vec!['a', 'b']);
     /// ```
+    #[must_use]
     pub fn into_keys(self) -> IntoKeys<K, V> {
         IntoKeys::from_delegate(self.pairs.into_iter())
     }
@@ -885,35 +961,36 @@ impl<K, V> AList<K, V> {
     /// Returns an iterator over the values of the `AList`.
     ///
     /// This method returns an iterator that yields references to the values of the key-value pairs stored in the `AList`.
-    /// The values are yielded in the order they were inserted, and the iterator will not modify the list.
+    /// The values are yielded in insertion order.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// let values: Vec<_> = alist.values().collect();
     /// assert_eq!(values, vec![&1, &2]);
     /// ```
-    pub fn values(&self) -> Values<K, V> {
+    #[must_use]
+    pub fn values(&self) -> Values<'_, K, V> {
         Values::from_delegate(self.pairs.iter())
     }
 
     /// Returns a mutable iterator over the values of the `AList`.
     ///
     /// This method returns a mutable iterator that allows modifying the values of the key-value pairs stored in the `AList`.
-    /// The values are yielded in the order they were inserted, and the iterator will not modify the structure of the list.
+    /// The values are yielded in insertion order.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// for value in alist.values_mut() {
     ///     *value *= 2;  // Doubling each value
@@ -922,62 +999,65 @@ impl<K, V> AList<K, V> {
     /// let values: Vec<_> = alist.values().collect();
     /// assert_eq!(&values[..], &[&2, &4]);
     /// ```
-    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+    #[must_use]
+    pub fn values_mut(&mut self) -> ValuesMut<'_, K, V> {
         ValuesMut::from_delegate(self.pairs.iter_mut())
     }
 
     /// Consumes the `AList` and returns an iterator over the values.
     ///
-    /// This method consumes the `AList` and returns an iterator that yields the values of the key-value pairs in the order
-    /// they were inserted. After calling `into_values`, the `AList` is no longer accessible as it has been consumed.
+    /// This method consumes the `AList` and returns an iterator that yields values in insertion order.
+    /// After calling `into_values`, the `AList` is no longer accessible as it has been consumed.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// let values: Vec<_> = alist.into_values().collect();
     /// assert_eq!(values, vec![1, 2]);
     /// ```
+    #[must_use]
     pub fn into_values(self) -> IntoValues<K, V> {
         IntoValues::from_delegate(self.pairs.into_iter())
     }
 
     /// Returns an iterator over the key-value pairs of the `AList`.
     ///
-    /// This method returns an iterator that yields references to the key-value pairs stored in the `AList` in the order
-    /// they were inserted. The iterator allows read-only access to both the keys and values.
+    /// This method returns an iterator that yields references to key-value pairs in insertion order.
+    /// The iterator allows read-only access to both the keys and values.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// let pairs: Vec<_> = alist.iter().collect();
-    /// assert_eq!(&pairs[..], &[(&"key1", &1), (&"key2", &2)]);
+    /// assert_eq!(&pairs[..], &[(&'a', &1), (&'b', &2)]);
     /// ```
-    pub fn iter(&self) -> Iter<K, V> {
+    #[must_use]
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter::from_delegate(self.pairs.iter())
     }
 
     /// Returns a mutable iterator over the key-value pairs of the `AList`.
     ///
-    /// This method returns a mutable iterator that allows modifying both the keys and values of the key-value pairs stored
-    /// in the `AList`. The iterator yields the key-value pairs in the order they were inserted.
+    /// This method returns a mutable iterator that allows reading keys and modifying values of the key-value pairs stored
+    /// in the `AList`. The iterator yields pairs in insertion order.
     ///
     /// ### Example
     /// ```rust
     /// use alist::AList;
     ///
     /// let mut alist = AList::new();
-    /// alist.insert("key1", 1);
-    /// alist.insert("key2", 2);
+    /// alist.insert('a', 1);
+    /// alist.insert('b', 2);
     ///
     /// for (_key, value) in alist.iter_mut() {
     ///     *value *= 2;  // Doubling each value
@@ -986,7 +1066,8 @@ impl<K, V> AList<K, V> {
     /// let values: Vec<_> = alist.values().collect();
     /// assert_eq!(&values[..], &[&2, &4]);
     /// ```
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+    #[must_use]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut::from_delegate(self.pairs.iter_mut())
     }
 }
@@ -1031,7 +1112,7 @@ impl<K: Clone, V: Clone> Clone for AList<K, V> {
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for AList<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut map = f.debug_map();
         self.pairs.iter().for_each(|(k, v)| {
             map.entry(k, v);
@@ -1040,1844 +1121,285 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for AList<K, V> {
     }
 }
 
-impl<K: Eq, V: PartialEq> PartialEq for AList<K, V> {
+impl<K: FastEq, V: PartialEq> PartialEq for AList<K, V> {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len()
-            && self
-                .iter()
-                .all(|(k, v)| other.get(k).filter(|w| v == *w).is_some())
+        self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
     }
 }
 
-impl<K: Eq, V: Eq> Eq for AList<K, V> {}
+impl<K: FastEq, V: Eq> Eq for AList<K, V> {}
 
 impl<K: Hash, V: Hash> Hash for AList<K, V> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let hasher_builder = global_hasher_builder();
-        let hash = self
-            .values()
-            .map(|p| hasher_builder.hash_one(p))
-            .fold(hasher_builder.hash_one(self.len()), |l, r| l ^ r);
+        let mut sum = 0_u64;
+        let mut xor = 0_u64;
+
+        for pair in &self.pairs {
+            let hash = hash_one(pair);
+            sum = sum.wrapping_add(hash);
+            xor ^= hash.rotate_left(32);
+        }
 
         state.write_usize(self.len());
-        state.write_u64(hash);
+        state.write_u64(sum);
+        state.write_u64(xor);
     }
 }
 
-fn global_hasher_builder() -> &'static impl BuildHasher<Hasher = DefaultHasher> {
-    static INSTANCE: OnceLock<RandomState> = OnceLock::new();
-    INSTANCE.get_or_init(RandomState::new)
+fn hash_one<T: Hash + ?Sized>(value: &T) -> u64 {
+    let mut hasher = AListHasher::default();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct AListHasher(u64);
+
+impl Default for AListHasher {
+    fn default() -> Self {
+        // 64-bit FNV-1a offset basis. This private hasher is only used to
+        // produce deterministic per-pair hashes before order-independent
+        // aggregation; the final hash is still written into the caller's hasher.
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for AListHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            // 64-bit FNV prime.
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    use alloc::{format, vec, vec::Vec};
 
-    use crate::{alist, AList, Bookmark};
+    use crate::{AList, alist};
 
     #[test]
-    fn alist_macro() {
-        let sut = alist! {
-            "k1" => "v1",
-            "k2" => "v2",
-            "k1" => "w1",
+    fn hash_is_order_independent_for_equal_lists() {
+        let l = alist! {
+            'x' => 1,
+            'y' => 2,
+            'z' => 3,
         };
-
-        assert_eq!(
-            sut.into_iter().collect::<Vec<_>>(),
-            [("k1", "w1"), ("k2", "v2")]
-        );
-    }
-
-    #[test]
-    fn hash() {
-        let symbols = ["x", "y", "z"];
-        let values = [1, 2, 3];
-
-        let mut pairs = symbols
-            .into_iter()
-            .zip(values.into_iter())
-            .collect::<Vec<_>>();
-
-        let mut l = pairs.iter().cloned().collect::<AList<_, _>>();
-
-        pairs.swap(0, 2);
-        let mut r = pairs.into_iter().collect::<AList<_, _>>();
+        let r = alist! {
+            'z' => 3,
+            'y' => 2,
+            'x' => 1,
+        };
 
         assert_eq!(l, r);
-
-        let hasher_builder = BuildHasherDefault::<DefaultHasher>::default();
-        let (h1, h2) = (hasher_builder.hash_one(&l), hasher_builder.hash_one(&r));
-        assert_eq!(h1, h2);
-
-        r.remove("x");
-        let (h1, h2) = (hasher_builder.hash_one(&l), hasher_builder.hash_one(&r));
-        assert_ne!(h1, h2);
-
-        l.remove("x");
-        let (h1, h2) = (hasher_builder.hash_one(&l), hasher_builder.hash_one(&r));
-        assert_eq!(h1, h2);
+        assert_eq!(super::hash_one(&l), super::hash_one(&r));
     }
 
     #[test]
-    fn new_creates_empty_alist() {
-        let sut: AList<&str, &str> = AList::new();
-        assert!(sut.is_empty(), "Expected the alist to be empty");
-        assert_eq!(sut.len(), 0, "Expected the length of the alist to be 0");
+    fn hash_includes_keys() {
+        let l = alist! { 'a' => 1 };
+        let r = alist! { 'b' => 1 };
+
+        assert_ne!(super::hash_one(&l), super::hash_one(&r));
     }
 
     #[test]
-    fn default_creates_empty_alist() {
-        let sut: AList<&str, &str> = AList::default();
-        assert!(sut.is_empty(), "Expected the alist to be empty");
-        assert_eq!(sut.len(), 0, "Expected the length of the alist to be 0");
+    fn constructors_create_empty_lists_with_expected_capacity() {
+        let new: AList<char, i32> = AList::new();
+        let default: AList<char, i32> = AList::default();
+        let with_capacity: AList<char, i32> = AList::with_capacity(8);
+
+        assert!(new.is_empty());
+        assert!(default.is_empty());
+        assert!(with_capacity.is_empty());
+        assert!(with_capacity.capacity() >= 8);
     }
 
     #[test]
-    fn with_capacity_creates_alist_with_specified_capacity() {
-        let capacity = 10;
-        let sut: AList<&str, &str> = AList::with_capacity(capacity);
-        assert!(sut.is_empty(), "Expected the alist to be empty");
-        assert!(
-            sut.capacity() >= capacity,
-            "Expected the alist to have a capacity of at least {}",
-            capacity
-        );
-    }
-
-    #[test]
-    fn bookmark_creates_valid_bookmark() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Create a bookmark for "key1"
-        if let Some(mut bookmark) = sut.bookmark("key1") {
-            assert_eq!(sut.get(&mut bookmark), Some(&"value1"));
-        } else {
-            panic!("Expected bookmark to be created for 'key1'");
-        }
-    }
-
-    #[test]
-    fn bookmark_returns_none_for_nonexistent_key() {
-        let sut: AList<&str, &str> = AList::new();
-
-        // Try creating a bookmark for a non-existent key
-        assert!(
-            sut.bookmark("nonexistent").is_none(),
-            "Expected None for nonexistent key"
-        );
-    }
-
-    #[test]
-    fn entry_insert_new_key() {
+    fn insert_adds_new_keys_and_replaces_existing_values() {
         let mut sut = AList::new();
 
-        // Insert a new key-value pair
-        sut.entry("key1").or_insert("value1");
+        assert_eq!(sut.insert('a', 1), None);
+        assert_eq!(sut.insert('b', 2), None);
+        assert_eq!(sut.insert('a', 3), Some(1));
 
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"value1"),
-            "Expected 'key1' to be inserted with 'value1'"
-        );
+        let pairs: Vec<_> = sut.iter().collect();
+        assert_eq!(pairs, vec![(&'a', &3), (&'b', &2)]);
     }
 
     #[test]
-    fn entry_modify_existing_key() {
+    fn from_iter_and_extend_keep_first_key_position_for_duplicates() {
+        let mut sut = [('a', 1), ('b', 2), ('a', 3)]
+            .into_iter()
+            .collect::<AList<_, _>>();
+
+        sut.extend([('c', 4), ('b', 5)]);
+
+        let pairs: Vec<_> = sut.iter().collect();
+        assert_eq!(pairs, vec![(&'a', &3), (&'b', &5), (&'c', &4)]);
+    }
+
+    #[test]
+    fn key_based_operations_target_last_matching_internal_pair() {
+        let mut sut = AList {
+            pairs: vec![('a', 1), ('b', 2), ('a', 3)],
+        };
+
+        assert_eq!(sut.position(&'a'), Some(2));
+        assert_eq!(sut.get(&'a'), Some(&3));
+        assert_eq!(sut.get_key_value(&'a'), Some((&'a', &3)));
+        assert_eq!(sut.insert('a', 4), Some(3));
+
+        assert_eq!(sut.get_mut(&'a').map(|value| *value), Some(4));
+        *sut.get_key_value_mut(&'a').unwrap().1 = 5;
+        sut.extend([('a', 6)]);
+        assert_eq!(sut.remove(&'a'), Some(6));
+
+        let pairs: Vec<_> = sut.iter().collect();
+        assert_eq!(pairs, vec![(&'a', &1), (&'b', &2)]);
+    }
+
+    #[test]
+    fn refresh_position_searches_before_previous_position_then_after_it() {
+        let sut = AList {
+            pairs: vec![('a', 1), ('b', 2), ('c', 3), ('d', 4)],
+        };
+
+        assert_eq!(sut.refresh_position(&'b', 3), Some(1));
+        assert_eq!(sut.refresh_position(&'d', 0), Some(3));
+        assert_eq!(sut.refresh_position(&'c', usize::MAX), Some(2));
+        assert_eq!(sut.refresh_position(&'x', 2), None);
+    }
+
+    #[test]
+    fn extend_from_references_clones_keys_and_values() {
+        let source = [('a', 1), ('b', 2)];
         let mut sut = AList::new();
-        sut.insert("key1", "value1");
 
-        // Modify the value of an existing key
-        sut.entry("key1").and_modify(|v| *v = "new_value");
+        sut.extend(source.iter().map(|(key, value)| (key, value)));
 
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"new_value"),
-            "Expected 'key1' to have its value updated to 'new_value'"
-        );
+        assert_eq!(sut.get(&'a'), Some(&1));
+        assert_eq!(sut.get(&'b'), Some(&2));
     }
 
     #[test]
-    fn entry_insert_if_not_exists() {
-        let mut sut = AList::new();
+    fn retain_filters_pairs_without_reordering_survivors() {
+        let mut sut = alist! {
+            'a' => 1,
+            'b' => 2,
+            'c' => 3,
+            'd' => 4,
+        };
 
-        // Insert a value if the key doesn't exist
-        sut.entry("key1").or_insert("value1");
+        sut.retain(|_, value| value % 2 == 0);
 
-        // Ensure the value is not overwritten for an existing key
-        sut.entry("key1").or_insert("other_value");
-
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"value1"),
-            "Expected 'key1' to remain 'value1' after re-insertion attempt"
-        );
+        let pairs: Vec<_> = sut.iter().collect();
+        assert_eq!(pairs, vec![(&'b', &2), (&'d', &4)]);
     }
 
     #[test]
-    fn insert_new_key() {
-        let mut sut = AList::new();
-
-        // Insert a new key-value pair
-        let result = sut.insert("key1", "value1");
-        assert!(result.is_none(), "Expected None for a new key insertion");
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-    }
-
-    #[test]
-    fn insert_update_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Update the value for an existing key
-        let result = sut.insert("key1", "new_value");
-        assert_eq!(
-            result,
-            Some("value1"),
-            "Expected 'value1' as the previous value"
-        );
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"new_value"),
-            "Expected 'key1' to map to 'new_value'"
-        );
-    }
-
-    #[test]
-    fn insert_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Verify both keys are present
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get("key2"),
-            Some(&"value2"),
-            "Expected 'key2' to map to 'value2'"
-        );
-    }
-
-    #[test]
-    fn get_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Retrieve an existing key
-        let result = sut.get("key1");
-        assert_eq!(
-            result,
-            Some(&"value1"),
-            "Expected to retrieve 'value1' for 'key1'"
-        );
-
-        // Retrieve an existing key by its bookmark
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let result = sut.get(&mut k1);
-        assert_eq!(
-            result,
-            Some(&"value1"),
-            "Expected to retrieve 'value1' for 'key1'"
-        );
-    }
-
-    #[test]
-    fn get_nonexistent_key() {
-        let sut: AList<&str, &str> = AList::new();
-
-        // Attempt to retrieve a non-existent key
-        let result = sut.get("nonexistent");
-        assert!(result.is_none(), "Expected None for a non-existent key");
-
-        // Attempt to retrieve a non-existent key from its bookmark
-        let mut bookmark = Bookmark::new("nonexistent");
-        let result = sut.get(&mut bookmark);
-        assert!(result.is_none(), "Expected None for a non-existent key");
-    }
-
-    #[test]
-    fn get_with_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Retrieve values for multiple keys
-        assert_eq!(
-            sut.get("key1"),
-            Some(&"value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get("key2"),
-            Some(&"value2"),
-            "Expected 'key2' to map to 'value2'"
-        );
-
-        // Retrieve values for multiple keys by their bookmarks
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let mut k2 = Bookmark::new("key2");
-        assert_eq!(
-            sut.get(&mut k1),
-            Some(&"value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get(&mut k2),
-            Some(&"value2"),
-            "Expected 'key2' to map to 'value2'"
-        );
-    }
-
-    #[test]
-    fn get_mut_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Retrieve an existing key
-        let result = sut.get_mut("key1");
-        assert_eq!(
-            result,
-            Some(&mut "value1"),
-            "Expected to retrieve 'value1' for 'key1'"
-        );
-
-        // Retrieve an existing key by its bookmark
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let result = sut.get_mut(&mut k1);
-        assert_eq!(
-            result,
-            Some(&mut "value1"),
-            "Expected to retrieve 'value1' for 'key1'"
-        );
-    }
-
-    #[test]
-    fn get_mut_nonexistent_key() {
-        let mut sut: AList<&str, &str> = AList::new();
-
-        // Attempt to retrieve a non-existent key
-        let result = sut.get_mut("nonexistent");
-        assert!(result.is_none(), "Expected None for a non-existent key");
-
-        // Attempt to retrieve a non-existent key from its bookmark
-        let mut bookmark = Bookmark::new("nonexistent");
-        let result = sut.get_mut(&mut bookmark);
-        assert!(result.is_none(), "Expected None for a non-existent key");
-    }
-
-    #[test]
-    fn get_mut_with_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Retrieve values for multiple keys
-        assert_eq!(
-            sut.get_mut("key1"),
-            Some(&mut "value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get_mut("key2"),
-            Some(&mut "value2"),
-            "Expected 'key2' to map to 'value2'"
-        );
-
-        // Retrieve values for multiple keys by their bookmarks
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let mut k2 = Bookmark::new("key2");
-        assert_eq!(
-            sut.get_mut(&mut k1),
-            Some(&mut "value1"),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get_mut(&mut k2),
-            Some(&mut "value2"),
-            "Expected 'key2' to map to 'value2'"
-        );
-    }
-
-    #[test]
-    fn get_key_value_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Retrieve an existing key-value pair
-        if let Some((key, value)) = sut.get_key_value("key1") {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        } else {
-            panic!("Expected to retrieve key-value pair for 'key1'");
-        }
-
-        // Retrieve an existing key-value pair by its bookmark
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        if let Some((key, value)) = sut.get_key_value(&mut k1) {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        } else {
-            panic!("Expected to retrieve key-value pair for 'key1'");
-        }
-    }
-
-    #[test]
-    fn get_key_value_nonexistent_key() {
-        let sut: AList<&str, &str> = AList::new();
-
-        // Attempt to retrieve a non-existent key
-        let result = sut.get_key_value("nonexistent");
-        assert!(result.is_none(), "Expected None for a non-existent key");
-
-        // Attempt to retrieve a non-existent key from its bookmark
-        let mut bookmark = Bookmark::new("nonexistent");
-        let result = sut.get_key_value(&mut bookmark);
-        assert!(result.is_none(), "Expected None for a non-existent key");
-    }
-
-    #[test]
-    fn get_key_value_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Retrieve key-value pairs for multiple keys
-        if let Some((key, value)) = sut.get_key_value("key1") {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        }
-
-        if let Some((key, value)) = sut.get_key_value("key2") {
-            assert_eq!(key, &"key2", "Expected 'key2' as the retrieved key");
-            assert_eq!(value, &"value2", "Expected 'value2' as the retrieved value");
-        }
-
-        // Retrievekey-value pairs for multiple keys by their bookmarks
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let mut k2 = Bookmark::new("key2");
-        assert_eq!(
-            sut.get_key_value(&mut k1),
-            Some((&"key1", &"value1")),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get_key_value(&mut k2),
-            Some((&"key2", &"value2")),
-            "Expected 'key2' to map to 'value2'"
-        );
-    }
-
-    #[test]
-    fn get_key_value_mut_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Retrieve an existing key-value pair
-        if let Some((key, value)) = sut.get_key_value_mut("key1") {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        } else {
-            panic!("Expected to retrieve key-value pair for 'key1'");
-        }
-
-        // Retrieve an existing key-value pair by its bookmark
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        if let Some((key, value)) = sut.get_key_value_mut(&mut k1) {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        } else {
-            panic!("Expected to retrieve key-value pair for 'key1'");
-        }
-    }
-
-    #[test]
-    fn get_key_value_mut_nonexistent_key() {
-        let mut sut: AList<&str, &str> = AList::new();
-
-        // Attempt to retrieve a non-existent key
-        let result = sut.get_key_value_mut("nonexistent");
-        assert!(result.is_none(), "Expected None for a non-existent key");
-
-        // Attempt to retrieve a non-existent key from its bookmark
-        let mut bookmark = Bookmark::new("nonexistent");
-        let result = sut.get_key_value_mut(&mut bookmark);
-        assert!(result.is_none(), "Expected None for a non-existent key");
-    }
-
-    #[test]
-    fn get_key_value_mut_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Retrieve key-value pairs for multiple keys
-        if let Some((key, value)) = sut.get_key_value_mut("key1") {
-            assert_eq!(key, &"key1", "Expected 'key1' as the retrieved key");
-            assert_eq!(value, &"value1", "Expected 'value1' as the retrieved value");
-        }
-
-        if let Some((key, value)) = sut.get_key_value_mut("key2") {
-            assert_eq!(key, &"key2", "Expected 'key2' as the retrieved key");
-            assert_eq!(value, &"value2", "Expected 'value2' as the retrieved value");
-        }
-
-        // Retrievekey-value pairs for multiple keys by their bookmarks
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let mut k2 = Bookmark::new("key2");
-        assert_eq!(
-            sut.get_key_value_mut(&mut k1),
-            Some((&"key1", &mut "value1")),
-            "Expected 'key1' to map to 'value1'"
-        );
-        assert_eq!(
-            sut.get_key_value_mut(&mut k2),
-            Some((&"key2", &mut "value2")),
-            "Expected 'key2' to map to 'value2'"
-        );
-    }
-
-    #[test]
-    fn contains_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-
-        // Check for an existing key
-        assert!(
-            sut.contains_key("key1"),
-            "Expected 'key1' to exist in the list"
-        );
-
-        // Check for an existing key by its bookmark
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        assert!(sut.contains_key(&mut k1));
-    }
-
-    #[test]
-    fn contains_nonexistent_key() {
-        let sut: AList<&str, &str> = AList::new();
-
-        // Check for a non-existent key
-        assert!(
-            !sut.contains_key("nonexistent"),
-            "Expected 'nonexistent' to not exist in the list"
-        );
-
-        // Check for an non-existent key by its bookmark
-        let mut bookmark = Bookmark::new("nonexistent");
-        assert!(
-            !sut.contains_key(&mut bookmark),
-            "Expected 'nonexistent' to not exist in the list"
-        );
-    }
-
-    #[test]
-    fn contains_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Check for multiple keys
-        assert!(
-            sut.contains_key("key1"),
-            "Expected 'key1' to exist in the list"
-        );
-        assert!(
-            sut.contains_key("key2"),
-            "Expected 'key2' to exist in the list"
-        );
-        assert!(
-            !sut.contains_key("key3"),
-            "Expected 'key3' to not exist in the list"
-        );
-
-        // Check for multiple keys by their bookmarks
-        let mut k1 = sut
-            .bookmark("key1")
-            .expect("Expected a valid bookmark for 'key1'");
-        let mut k2 = Bookmark::new("key2");
-        let mut k3 = Bookmark::new("key3");
-        assert!(
-            sut.contains_key(&mut k1),
-            "Expected 'key1' to exist in the list"
-        );
-        assert!(
-            sut.contains_key(&mut k2),
-            "Expected 'key2' to exist in the list"
-        );
-        assert!(
-            !sut.contains_key(&mut k3),
-            "Expected 'key3' to not exist in the list"
-        );
-    }
-
-    #[test]
-    fn remove_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Remove an existing key
-        let result = sut.remove("key1");
-        assert_eq!(
-            result,
-            Some("value1"),
-            "Expected to remove 'key1' with value 'value1'"
-        );
-        assert!(
-            !sut.contains_key("key1"),
-            "Expected 'key1' to be removed from the list"
-        );
-
-        // Remove an existing key by its bookmark
-        let k2 = sut
-            .bookmark("key2")
-            .expect("Expected a valid bookmark for 'key2'");
-        let result = sut.remove(k2);
-        assert_eq!(
-            result,
-            Some("value2"),
-            "Expected to remove 'key2' with value 'value2'"
-        );
-        assert!(
-            !sut.contains_key("key2"),
-            "Expected 'key2' to be removed from the list"
-        );
-    }
-
-    #[test]
-    fn remove_nonexistent_key() {
-        let mut sut: AList<&str, &str> = AList::new();
-
-        // Attempt to remove a non-existent key
-        let result = sut.remove("nonexistent");
-        assert!(
-            result.is_none(),
-            "Expected None when attempting to remove a non-existent key"
-        );
-
-        // Attempt to remove a non-existent key by its bookmark
-        let bookmark = Bookmark::new("nonexistent");
-        let result = sut.remove(bookmark);
-        assert!(
-            result.is_none(),
-            "Expected None when attempting to remove a non-existent key"
-        );
-    }
-
-    #[test]
-    fn remove_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-        sut.insert("key3", "value3");
-        sut.insert("key4", "value4");
-
-        // Remove multiple keys
-        assert_eq!(
-            sut.remove("key1"),
-            Some("value1"),
-            "Expected to remove 'key1' with value 'value1'"
-        );
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-
-        assert_eq!(
-            sut.remove("key2"),
-            Some("value2"),
-            "Expected to remove 'key2' with value 'value2'"
-        );
-        assert!(!sut.contains_key("key2"), "Expected 'key2' to be removed");
-
-        // Remove multiple keys by their bookmarks
-        let k3 = sut
-            .bookmark("key3")
-            .expect("Expected a valid bookmark for 'key3'");
-        let k4 = Bookmark::new("key4");
-
-        assert_eq!(
-            sut.remove(k3),
-            Some("value3"),
-            "Expected to remove 'key3' with value 'value3'"
-        );
-        assert!(!sut.contains_key("key3"), "Expected 'key3' to be removed");
-
-        assert_eq!(
-            sut.remove(k4),
-            Some("value4"),
-            "Expected to remove 'key4' with value 'value4'"
-        );
-        assert!(!sut.contains_key("key4"), "Expected 'key4' to be removed");
-    }
-
-    #[test]
-    fn remove_entry_existing_key() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-
-        // Remove an existing key-value pair
-        let result = sut.remove_entry("key1");
-        assert_eq!(
-            result,
-            Some(("key1", "value1")),
-            "Expected to remove 'key1' with value 'value1'"
-        );
-        assert!(
-            !sut.contains_key("key1"),
-            "Expected 'key1' to be removed from the list"
-        );
-
-        // Remove an existing key-value pair by its bookmark
-        let k2 = sut.bookmark("key2").unwrap();
-        let result = sut.remove_entry(k2);
-        assert_eq!(
-            result,
-            Some(("key2", "value2")),
-            "Expected to remove 'key2' with value 'value2'"
-        );
-        assert!(
-            !sut.contains_key("key2"),
-            "Expected 'key2' to be removed from the list"
-        );
-    }
-
-    #[test]
-    fn remove_entry_nonexistent_key() {
-        let mut sut: AList<&str, &str> = AList::new();
-
-        // Attempt to remove a non-existent key
-        let result = sut.remove_entry("nonexistent");
-        assert!(
-            result.is_none(),
-            "Expected None when attempting to remove a non-existent key"
-        );
-
-        // Attempt to remove a non-existent key by its bookmark
-        let bookmark = Bookmark::new("nonexistent");
-        let result = sut.remove_entry(bookmark);
-        assert!(
-            result.is_none(),
-            "Expected None when attempting to remove a non-existent key"
-        );
-    }
-
-    #[test]
-    fn remove_entry_multiple_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", "value1");
-        sut.insert("key2", "value2");
-        sut.insert("key3", "value3");
-        sut.insert("key4", "value4");
-
-        // Remove multiple key-value pairs
-        assert_eq!(
-            sut.remove_entry("key1"),
-            Some(("key1", "value1")),
-            "Expected to remove 'key1' with value 'value1'"
-        );
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-
-        assert_eq!(
-            sut.remove_entry("key2"),
-            Some(("key2", "value2")),
-            "Expected to remove 'key2' with value 'value2'"
-        );
-        assert!(!sut.contains_key("key2"), "Expected 'key2' to be removed");
-
-        // Remove multiple key-value pairs by their bookmarks
-        let k3 = sut
-            .bookmark("key3")
-            .expect("Expected a valid bookmark for 'key3'");
-        let k4 = Bookmark::new("key4");
-
-        assert_eq!(
-            sut.remove_entry(k3),
-            Some(("key3", "value3")),
-            "Expected to remove 'key3' with value 'value3'"
-        );
-        assert!(!sut.contains_key("key3"), "Expected 'key3' to be removed");
-
-        assert_eq!(
-            sut.remove_entry(k4),
-            Some(("key4", "value4")),
-            "Expected to remove 'key4' with value 'value4'"
-        );
-        assert!(!sut.contains_key("key4"), "Expected 'key4' to be removed");
-    }
-
-    #[test]
-    fn retain_some_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        sut.insert("key3", 3);
-
-        // Retain only pairs where the value is greater than 1
-        sut.retain(|_, v| *v > 1);
-
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert!(sut.contains_key("key2"), "Expected 'key2' to be retained");
-        assert!(sut.contains_key("key3"), "Expected 'key3' to be retained");
-    }
-
-    #[test]
-    fn retain_all_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Retain all pairs
-        sut.retain(|_, _| true);
-
-        assert!(sut.contains_key("key1"), "Expected 'key1' to be retained");
-        assert!(sut.contains_key("key2"), "Expected 'key2' to be retained");
-    }
-
-    #[test]
-    fn retain_no_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Remove all pairs
-        sut.retain(|_, _| false);
-
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert!(!sut.contains_key("key2"), "Expected 'key2' to be removed");
-    }
-
-    #[test]
-    fn retain_based_on_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        sut.insert("key3", 3);
-
-        // Retain only pairs with keys starting with 'key2'
-        sut.retain(|k, _| *k == "key2");
-
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert!(sut.contains_key("key2"), "Expected 'key2' to be retained");
-        assert!(!sut.contains_key("key3"), "Expected 'key3' to be removed");
-    }
-
-    #[test]
-    fn retain_mut_some_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        sut.insert("key3", 3);
-
-        // Retain pairs with even values and double their values
-        sut.retain_mut(|_, v| {
-            if *v % 2 == 0 {
-                *v *= 2;
+    fn retain_mut_can_modify_surviving_values() {
+        let mut sut = alist! {
+            'a' => 1,
+            'b' => 2,
+            'c' => 3,
+        };
+
+        sut.retain_mut(|_, value| {
+            if *value % 2 == 1 {
+                *value *= 10;
                 true
             } else {
                 false
             }
         });
 
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert_eq!(
-            sut.get("key2"),
-            Some(&4),
-            "Expected 'key2' to be retained and doubled"
-        );
-        assert!(!sut.contains_key("key3"), "Expected 'key3' to be removed");
+        let pairs: Vec<_> = sut.iter().collect();
+        assert_eq!(pairs, vec![(&'a', &10), (&'c', &30)]);
     }
 
     #[test]
-    fn retain_mut_all_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
+    fn reserve_and_shrink_manage_capacity_without_changing_items() {
+        let mut sut = alist! { 'a' => 1, 'b' => 2 };
 
-        // Retain all pairs and increment their values
-        sut.retain_mut(|_, v| {
-            *v += 1;
-            true
-        });
+        sut.reserve(16);
+        assert!(sut.capacity() >= 18);
 
-        assert_eq!(
-            sut.get("key1"),
-            Some(&2),
-            "Expected 'key1' to be retained and incremented"
-        );
-        assert_eq!(
-            sut.get("key2"),
-            Some(&3),
-            "Expected 'key2' to be retained and incremented"
-        );
-    }
-
-    #[test]
-    fn retain_mut_no_pairs() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Remove all pairs
-        sut.retain_mut(|_, _| false);
-
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert!(!sut.contains_key("key2"), "Expected 'key2' to be removed");
-    }
-
-    #[test]
-    fn retain_mut_based_on_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        sut.insert("key3", 3);
-
-        // Retain only pairs with keys starting with 'key2' and increment their values
-        sut.retain_mut(|k, v| {
-            if *k == "key2" {
-                *v += 1;
-                true
-            } else {
-                false
-            }
-        });
-
-        assert!(!sut.contains_key("key1"), "Expected 'key1' to be removed");
-        assert_eq!(
-            sut.get("key2"),
-            Some(&3),
-            "Expected 'key2' to be retained and incremented"
-        );
-        assert!(!sut.contains_key("key3"), "Expected 'key3' to be removed");
-    }
-
-    #[test]
-    fn extend_with_new_items() {
-        let mut sut = AList::new();
-
-        let new_items = vec![("key1", 1), ("key2", 2), ("key3", 3)];
-        sut.extend(new_items);
-
-        assert_eq!(sut.get("key1"), Some(&1), "Expected 'key1' to have value 1");
-        assert_eq!(sut.get("key2"), Some(&2), "Expected 'key2' to have value 2");
-        assert_eq!(sut.get("key3"), Some(&3), "Expected 'key3' to have value 3");
-    }
-
-    #[test]
-    fn extend_with_replacing_items() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let new_items = vec![("key2", 20), ("key3", 30)];
-        sut.extend(new_items);
-
-        assert_eq!(
-            sut.get("key1"),
-            Some(&1),
-            "Expected 'key1' to retain value 1"
-        );
-        assert_eq!(
-            sut.get("key2"),
-            Some(&20),
-            "Expected 'key2' to be replaced with value 20"
-        );
-        assert_eq!(
-            sut.get("key3"),
-            Some(&30),
-            "Expected 'key3' to be inserted with value 30"
-        );
-    }
-
-    #[test]
-    fn extend_with_empty_iterator() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-
-        sut.extend(Vec::<(&str, i32)>::new());
-
-        assert_eq!(
-            sut.get("key1"),
-            Some(&1),
-            "Expected 'key1' to remain unchanged"
-        );
-        assert_eq!(sut.len(), 1, "Expected the AList to contain one item");
-    }
-
-    #[test]
-    fn extend_with_duplicate_keys() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-
-        let new_items = vec![("key1", 10), ("key1", 20)];
-        sut.extend(new_items);
-
-        assert_eq!(
-            sut.get("key1"),
-            Some(&20),
-            "Expected 'key1' to have the last inserted value 20"
-        );
-    }
-
-    #[test]
-    fn extend_with_ref_items() {
-        let mut sut: AList<&str, i32> = AList::new();
-
-        let new_items = [(&"key1", &1), (&"key2", &2), (&"key3", &3)];
-        sut.extend(new_items);
-
-        assert_eq!(sut.get("key1"), Some(&1), "Expected 'key1' to have value 1");
-        assert_eq!(sut.get("key2"), Some(&2), "Expected 'key2' to have value 2");
-        assert_eq!(sut.get("key3"), Some(&3), "Expected 'key3' to have value 3");
-    }
-
-    #[test]
-    fn shrink_to_fit_reduces_capacity() {
-        let mut sut = AList::with_capacity(100);
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let old_capacity = sut.capacity();
-        assert!(
-            old_capacity >= 100,
-            "Expected initial capacity to be at least 100"
-        );
+        sut.shrink_to(4);
+        assert!(sut.capacity() >= 4);
+        assert_eq!(sut.len(), 2);
+        assert_eq!(sut.get(&'a'), Some(&1));
+        assert_eq!(sut.get(&'b'), Some(&2));
 
         sut.shrink_to_fit();
-        let new_capacity = sut.capacity();
-
-        assert!(
-            new_capacity >= sut.len(),
-            "Expected capacity to be no less than length"
-        );
-        assert!(
-            new_capacity <= old_capacity,
-            "Expected capacity to be reduced"
-        );
+        assert!(sut.capacity() >= sut.len());
     }
 
     #[test]
-    fn shrink_to_fit_no_effect_when_exact_capacity() {
-        let mut sut = AList::with_capacity(2);
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let old_capacity = sut.capacity();
-        sut.shrink_to_fit();
-        let new_capacity = sut.capacity();
-
-        assert_eq!(
-            new_capacity, old_capacity,
-            "Expected capacity to remain unchanged"
-        );
-    }
-
-    #[test]
-    fn shrink_to_reduces_capacity() {
-        let mut sut = AList::with_capacity(100);
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let old_capacity = sut.capacity();
-        assert!(
-            old_capacity >= 100,
-            "Expected initial capacity to be at least 100"
-        );
-
-        sut.shrink_to(10);
-        let new_capacity = sut.capacity();
-
-        assert!(
-            new_capacity >= 10,
-            "Expected capacity to be no less than the specified minimum"
-        );
-        assert!(
-            new_capacity <= old_capacity,
-            "Expected capacity to be reduced"
-        );
-    }
-
-    #[test]
-    fn shrink_to_no_effect_when_below_length() {
-        let mut sut = AList::with_capacity(2);
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let old_capacity = sut.capacity();
-        sut.shrink_to(1);
-        let new_capacity = sut.capacity();
-
-        assert_eq!(
-            new_capacity, old_capacity,
-            "Expected capacity to remain unchanged"
-        );
-    }
-
-    #[test]
-    fn shrink_to_exact_length() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        sut.shrink_to(sut.len());
-        let new_capacity = sut.capacity();
-
-        assert_eq!(
-            new_capacity,
-            sut.len(),
-            "Expected capacity to match the length of the AList"
-        );
-    }
-
-    #[test]
-    fn reserve_increases_capacity_when_needed() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let initial_capacity = sut.capacity();
-
-        sut.reserve(100);
-        assert!(
-            sut.capacity() >= 100,
-            "Expected capacity to be at least 100"
-        );
-        assert!(
-            sut.capacity() > initial_capacity,
-            "Expected capacity to increase"
-        );
-    }
-
-    #[test]
-    fn reserve_does_not_increase_capacity_if_sufficient() {
-        let mut sut: AList<&str, i32> = AList::with_capacity(100);
-        let initial_capacity = sut.capacity();
-
-        sut.reserve(10);
-        assert_eq!(
-            sut.capacity(),
-            initial_capacity,
-            "Expected capacity to remain unchanged"
-        );
-    }
-
-    #[test]
-    fn reserve_does_not_increase_capacity_for_zero() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let initial_capacity = sut.capacity();
-
-        sut.reserve(0);
-        assert_eq!(
-            sut.capacity(),
-            initial_capacity,
-            "Expected capacity to remain unchanged"
-        );
-    }
-
-    #[test]
-    fn reserve_exact_increases_capacity_when_needed() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let initial_capacity = sut.capacity();
-
-        sut.reserve_exact(100);
-        assert!(
-            sut.capacity() >= 100,
-            "Expected capacity to be at least 100"
-        );
-        assert!(
-            sut.capacity() > initial_capacity,
-            "Expected capacity to increase"
-        );
-    }
-
-    #[test]
-    fn reserve_exact_does_not_increase_capacity_if_sufficient() {
-        let mut sut: AList<&str, i32> = AList::with_capacity(100);
-        let initial_capacity = sut.capacity();
-
-        sut.reserve_exact(10);
-        assert_eq!(
-            sut.capacity(),
-            initial_capacity,
-            "Expected capacity to remain unchanged"
-        );
-    }
-
-    #[test]
-    fn reserve_exact_does_not_increase_capacity_for_zero() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let initial_capacity = sut.capacity();
+    fn reserve_exact_handles_zero_and_existing_capacity() {
+        let mut sut: AList<char, i32> = AList::with_capacity(4);
+        let capacity = sut.capacity();
 
         sut.reserve_exact(0);
-        assert_eq!(
-            sut.capacity(),
-            initial_capacity,
-            "Expected capacity to remain unchanged"
-        );
+        sut.reserve_exact(2);
+
+        assert_eq!(sut.capacity(), capacity);
     }
 
     #[test]
-    fn clear_removes_all_elements() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        assert_eq!(sut.len(), 2);
+    fn clear_removes_items_but_keeps_capacity_available() {
+        let mut sut = AList::with_capacity(8);
+        sut.insert('a', 1);
+        sut.insert('b', 2);
+        let capacity = sut.capacity();
 
         sut.clear();
+
+        assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
-        assert!(sut.is_empty(), "Expected AList to be empty after clear");
+        assert!(sut.capacity() >= capacity);
     }
 
     #[test]
-    fn clear_leaves_capacity_untouched() {
-        let mut sut = AList::with_capacity(100);
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        let old_capacity = sut.capacity();
+    fn clone_is_independent_from_source_after_clone() {
+        let mut sut = alist! { 'a' => 1, 'b' => 2 };
+        let clone = sut.clone();
 
-        sut.clear();
-        assert_eq!(sut.len(), 0);
-        assert!(
-            sut.capacity() >= old_capacity,
-            "Expected capacity to remain the same after clear"
-        );
+        sut.insert('c', 3);
+
+        assert_eq!(clone.get(&'a'), Some(&1));
+        assert_eq!(clone.get(&'b'), Some(&2));
+        assert_eq!(clone.get(&'c'), None);
     }
 
     #[test]
-    fn capacity_increases_with_insertions() {
-        let mut sut = AList::new();
-        let initial_capacity = sut.capacity();
+    fn equality_is_order_independent_but_checks_keys_values_and_length() {
+        let l = alist! { 'a' => 1, 'b' => 2 };
+        let same_different_order = alist! { 'b' => 2, 'a' => 1 };
+        let different_value = alist! { 'a' => 1, 'b' => 3 };
+        let different_key = alist! { 'a' => 1, 'c' => 2 };
+        let different_len = alist! { 'a' => 1 };
 
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        assert!(
-            sut.capacity() >= initial_capacity,
-            "Expected capacity to be at least 2 after insertions"
-        );
-
-        // After removing elements, the capacity shouldn't shrink unless manually changed (e.g., via shrink_to_fit)
-        sut.remove("key1");
-        assert!(
-            sut.capacity() >= 2,
-            "Expected capacity to remain the same after removal"
-        );
+        assert_eq!(l, same_different_order);
+        assert_ne!(l, different_value);
+        assert_ne!(l, different_key);
+        assert_ne!(l, different_len);
     }
 
     #[test]
-    fn capacity_does_not_decrease_after_clear() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        let current_capacity = sut.capacity();
-
-        sut.clear();
-        assert_eq!(sut.len(), 0);
-        assert!(
-            sut.capacity() >= current_capacity,
-            "Expected capacity to remain unchanged after clear"
-        );
-    }
-
-    #[test]
-    fn capacity_after_reserve() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let initial_capacity = sut.capacity();
-
-        sut.reserve(100);
-        assert!(
-            sut.capacity() >= 100,
-            "Expected capacity to increase after reserve"
-        );
-        assert!(
-            sut.capacity() > initial_capacity,
-            "Expected capacity to increase after reserve"
-        );
-    }
-
-    #[test]
-    fn capacity_does_not_increase_with_zero_insertions() {
+    fn debug_uses_current_insertion_order() {
         let mut sut = alist! {
-            "key1" => 1,
+            'b' => 2,
+            'a' => 1,
+            'c' => 3,
         };
-        let initial_capacity = sut.capacity();
+        assert!(sut.remove(&'a').is_some());
 
-        sut.remove("key1");
-
-        assert_eq!(
-            sut.capacity(),
-            initial_capacity,
-            "Expected capacity to remain the same after no insertions"
-        );
-    }
-
-    #[test]
-    fn len_returns_correct_number_of_elements() {
-        let mut sut = AList::new();
-        assert_eq!(sut.len(), 0);
-
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-        assert_eq!(sut.len(), 2);
-
-        sut.remove("key1");
-        assert_eq!(sut.len(), 1);
-
-        sut.clear();
-        assert_eq!(sut.len(), 0);
-    }
-
-    #[test]
-    fn is_empty_returns_correct_status() {
-        let mut sut = AList::new();
-        assert!(sut.is_empty(), "Expected AList to be empty initially");
-
-        sut.insert("key1", 1);
-        assert!(
-            !sut.is_empty(),
-            "Expected AList to be non-empty after insertion"
-        );
-
-        sut.clear();
-        assert!(sut.is_empty(), "Expected AList to be empty after clearing");
-    }
-
-    #[test]
-    fn is_empty_after_remove() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.remove("key1");
-
-        assert!(
-            sut.is_empty(),
-            "Expected AList to be empty after removal of last element"
-        );
-    }
-
-    #[test]
-    fn keys_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let keys: Vec<_> = sut.keys().collect();
-        assert_eq!(
-            &keys[..],
-            &[&"key1", &"key2"],
-            "Expected keys to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn keys_is_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let keys: Vec<_> = sut.keys().collect();
-        assert!(
-            keys.is_empty(),
-            "Expected keys iterator to be empty when AList is empty"
-        );
-    }
-
-    #[test]
-    fn keys_does_not_modify_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let mut keys = sut.keys();
-        assert_eq!(keys.next(), Some(&"key1"));
-        assert_eq!(keys.next(), Some(&"key2"));
-
-        // Ensure that the original list is unchanged
-        assert_eq!(sut.len(), 2);
-        assert_eq!(sut.get("key1"), Some(&1));
-        assert_eq!(sut.get("key2"), Some(&2));
-    }
-
-    #[test]
-    fn into_keys_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let keys: Vec<_> = sut.into_keys().collect();
-        assert_eq!(
-            keys,
-            vec!["key1", "key2"],
-            "Expected keys to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn into_keys_consumes_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let keys: Vec<_> = sut.into_keys().collect();
-        assert_eq!(keys, vec!["key1", "key2"]);
-    }
-
-    #[test]
-    fn into_keys_returns_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let keys: Vec<_> = sut.into_keys().collect();
-        assert!(
-            keys.is_empty(),
-            "Expected into_keys to return an empty iterator when AList is empty"
-        );
-    }
-
-    #[test]
-    fn values_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let values: Vec<_> = sut.values().collect();
-        assert_eq!(
-            values,
-            vec![&1, &2],
-            "Expected values to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn values_is_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let values: Vec<_> = sut.values().collect();
-        assert!(
-            values.is_empty(),
-            "Expected values iterator to be empty when AList is empty"
-        );
-    }
-
-    #[test]
-    fn values_does_not_modify_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let mut values = sut.values();
-        assert_eq!(values.next(), Some(&1));
-        assert_eq!(values.next(), Some(&2));
-
-        // Ensure that the original list is unchanged
-        assert_eq!(sut.len(), 2);
-        assert_eq!(sut.get("key1"), Some(&1));
-        assert_eq!(sut.get("key2"), Some(&2));
-    }
-
-    #[test]
-    fn values_mut_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let values: Vec<_> = sut.values_mut().collect();
-        assert_eq!(
-            values,
-            vec![&mut 1, &mut 2],
-            "Expected values to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn values_mut_allows_modifying_values() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        for value in sut.values_mut() {
-            *value *= 2; // Doubling each value
-        }
-
-        let values: Vec<_> = sut.values().collect();
-        assert_eq!(
-            &values[..],
-            &[&2, &4],
-            "Expected values to be doubled after modification"
-        );
-    }
-
-    #[test]
-    fn values_mut_is_empty_when_list_is_empty() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let values: Vec<_> = sut.values_mut().collect();
-        assert!(
-            values.is_empty(),
-            "Expected values_mut iterator to be empty when AList is empty"
-        );
-    }
-
-    #[test]
-    fn values_mut_does_not_modify_the_structure_of_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Modifying values using values_mut
-        for value in sut.values_mut() {
-            *value *= 2;
-        }
-
-        // Ensure that the structure (keys) is unchanged
-        assert_eq!(sut.len(), 2);
-        assert_eq!(sut.get("key1"), Some(&2));
-        assert_eq!(sut.get("key2"), Some(&4));
-    }
-
-    #[test]
-    fn into_values_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let values: Vec<_> = sut.into_values().collect();
-        assert_eq!(
-            values,
-            vec![1, 2],
-            "Expected values to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn into_values_consumes_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let values: Vec<_> = sut.into_values().collect();
-        assert_eq!(values, vec![1, 2]);
-    }
-
-    #[test]
-    fn into_values_returns_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let values: Vec<_> = sut.into_values().collect();
-        assert!(
-            values.is_empty(),
-            "Expected into_values to return an empty iterator when AList is empty"
-        );
-    }
-
-    #[test]
-    fn iter_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let pairs: Vec<_> = sut.iter().collect();
-        assert_eq!(
-            pairs,
-            vec![(&"key1", &1), (&"key2", &2)],
-            "Expected key-value pairs to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn iter_is_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let pairs: Vec<_> = sut.iter().collect();
-        assert!(
-            pairs.is_empty(),
-            "Expected iter to return an empty iterator when AList is empty"
-        );
-    }
-
-    #[test]
-    fn iter_does_not_modify_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Iterating over the list should not modify it
-        for (_key, value) in sut.iter() {
-            // Just checking that we can access the values without modifying them
-            assert!(*value == 1 || *value == 2);
-        }
-
-        // Ensure that the structure (key-value pairs) is unchanged
-        assert_eq!(sut.len(), 2);
-        assert_eq!(sut.get("key1"), Some(&1));
-        assert_eq!(sut.get("key2"), Some(&2));
-    }
-
-    #[test]
-    fn iter_mut_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let pairs: Vec<_> = sut.iter_mut().collect();
-        assert_eq!(
-            pairs,
-            vec![(&"key1", &mut 1), (&"key2", &mut 2)],
-            "Expected key-value pairs to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn iter_mut_allows_modifying_values() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        for (_key, value) in sut.iter_mut() {
-            *value *= 2; // Doubling each value
-        }
-
-        let values: Vec<_> = sut.values().collect();
-        assert_eq!(
-            &values[..],
-            &[&2, &4],
-            "Expected values to be doubled after modification"
-        );
-    }
-
-    #[test]
-    fn iter_mut_is_empty_when_list_is_empty() {
-        let mut sut: AList<&str, i32> = AList::new();
-        let pairs: Vec<_> = sut.iter_mut().collect();
-        assert!(
-            pairs.is_empty(),
-            "Expected iter_mut to return an empty iterator when AList is empty"
-        );
-    }
-
-    #[test]
-    fn iter_mut_does_not_modify_the_structure_of_the_list() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        // Modifying values using iter_mut
-        for (_key, value) in sut.iter_mut() {
-            *value *= 2;
-        }
-
-        // Ensure that the structure (keys) is unchanged
-        assert_eq!(sut.len(), 2);
-        assert_eq!(sut.get("key1"), Some(&2));
-        assert_eq!(sut.get("key2"), Some(&4));
-    }
-
-    #[test]
-    fn into_iter_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let pairs: Vec<_> = sut.into_iter().collect();
-        assert_eq!(
-            pairs,
-            vec![("key1", 1), ("key2", 2)],
-            "Expected key-value pairs to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn into_iter_is_empty_when_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let pairs: Vec<_> = sut.into_iter().collect();
-        assert!(
-            pairs.is_empty(),
-            "Expected into_iter to return an empty iterator when AList is empty"
-        );
-    }
-
-    #[test]
-    fn into_iter_for_alist_ref_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let pairs: Vec<_> = (&sut).into_iter().collect();
-        assert_eq!(
-            &pairs[..],
-            &[(&"key1", &1), (&"key2", &2)],
-            "Expected key-value pairs to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn into_iter_for_alist_mut_ref_returns_correct_order_of_insertions() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let pairs: Vec<_> = (&mut sut).into_iter().collect();
-        assert_eq!(
-            &pairs[..],
-            &[(&"key1", &mut 1), (&"key2", &mut 2)],
-            "Expected key-value pairs to be in the same order as they were inserted"
-        );
-    }
-
-    #[test]
-    fn clone_creates_an_exact_copy() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        sut.insert("key2", 2);
-
-        let clone = sut.clone();
-
-        // Ensure the clone contains the same elements in the same order
-        assert_eq!(sut.len(), clone.len());
-        assert_eq!(sut.get("key1"), clone.get("key1"));
-        assert_eq!(sut.get("key2"), clone.get("key2"));
-
-        // Ensure the original and the clone are independent
-        sut.insert("key3", 3);
-        assert!(
-            clone.get("key3").is_none(),
-            "Expected clone to not reflect changes made to the original after cloning"
-        );
-    }
-
-    #[test]
-    fn clone_of_empty_list_is_empty() {
-        let sut: AList<&str, i32> = AList::new();
-        let clone = sut.clone();
-
-        // Ensure the clone is also empty
-        assert!(
-            clone.is_empty(),
-            "Expected the clone of an empty AList to also be empty"
-        );
-    }
-
-    #[test]
-    fn equal_lists_are_detected() {
-        let mut sut1 = AList::new();
-        sut1.insert("key1", 1);
-        sut1.insert("key2", 2);
-
-        let mut sut2 = AList::new();
-        sut2.insert("key1", 1);
-        sut2.insert("key2", 2);
-
-        assert_eq!(sut1, sut2, "Expected two identical ALists to be equal");
-    }
-
-    #[test]
-    fn equal_lists_with_different_order_are_detected() {
-        let mut sut1 = AList::new();
-        sut1.insert("key1", 1);
-        sut1.insert("key2", 2);
-
-        let mut sut2 = AList::new();
-        sut2.insert("key2", 2);
-        sut2.insert("key1", 1);
-
-        assert_eq!(
-            sut1, sut2,
-            "Expected two ALists with identical keys/values but different orders to be equal"
-        );
-    }
-
-    #[test]
-    fn unequal_lists_are_detected_due_to_different_keys() {
-        let mut sut1 = AList::new();
-        sut1.insert("key1", 1);
-        sut1.insert("key2", 2);
-
-        let mut sut2 = AList::new();
-        sut2.insert("key3", 1);
-        sut2.insert("key2", 2);
-
-        assert_ne!(
-            sut1, sut2,
-            "Expected two ALists with different keys to not be equal"
-        );
-    }
-
-    #[test]
-    fn unequal_lists_are_detected_due_to_different_values() {
-        let mut sut1 = AList::new();
-        sut1.insert("key1", 1);
-        sut1.insert("key2", 2);
-
-        let mut sut2 = AList::new();
-        sut2.insert("key1", 1);
-        sut2.insert("key2", 3);
-
-        assert_ne!(
-            sut1, sut2,
-            "Expected two ALists with the same keys but different values to not be equal"
-        );
-    }
-
-    #[test]
-    fn unequal_lists_are_detected_due_to_different_lengths() {
-        let mut sut1 = AList::new();
-        sut1.insert("key1", 1);
-
-        let mut sut2 = AList::new();
-        sut2.insert("key1", 1);
-        sut2.insert("key2", 2);
-
-        assert_ne!(
-            sut1, sut2,
-            "Expected two ALists with different lengths to not be equal"
-        );
-    }
-
-    #[test]
-    fn debug_format_displays_empty_list() {
-        let sut: AList<&str, i32> = AList::new();
-        let debug_output = format!("{:?}", sut);
-
-        assert_eq!(
-            debug_output, "{}",
-            "Expected debug output to show an empty AList"
-        );
-    }
-
-    #[test]
-    fn debug_format_displays_single_item() {
-        let mut sut = AList::new();
-        sut.insert("key1", 1);
-        let debug_output = format!("{:?}", sut);
-
-        assert_eq!(
-            debug_output, r#"{"key1": 1}"#,
-            "Expected debug output to show a single key-value pair"
-        );
-    }
-
-    #[test]
-    fn debug_format_preserves_order_of_insertion() {
-        let mut sut = AList::new();
-        sut.insert("key2", 2);
-        sut.insert("key1", 1);
-        let debug_output = format!("{:?}", sut);
-
-        assert_eq!(
-            debug_output, r#"{"key2": 2, "key1": 1}"#,
-            "Expected debug output to preserve insertion order"
-        );
+        assert_eq!(format!("{sut:?}"), r#"{'b': 2, 'c': 3}"#);
     }
 }
